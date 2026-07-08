@@ -294,18 +294,45 @@ dependents can target specific elements (`<arrayid>_<idx>`).
 
 ---
 
-## 11. Execution: logging and re-runs
+## 11. Execution: logging, reconciliation, re-runs
 
-- On submit, the engine appends a **persistent log** entry per node: identity,
-  resolved job id (and array index, if any), rendered command, submit time. Exit
-  state is reconciled later from `sacct` and written back, so the log — not
-  shared `sacct` — is the project's source of truth.
-- On re-run, nodes recorded **completed** are skipped; missing/failed nodes are
-  (re)submitted with `afterok`/`aftercorr` edges pointing at current job ids.
+The append-only JSONL log is the project's memory; `sacct` is SLURM's. Both
+`status` and `submit` reconcile the two by job id.
 
-**Subcommands:** `dag` (print resolved nodes + edges), `dry` (print exact
-`cc-submit` commands with placeholder ids), `submit` (submit + log),
-`status`/`retry` (reconcile from `sacct`; resubmit incomplete).
+- **reconcile** queries `sacct` once for every job whose last logged state is
+  non-terminal, folds the `.batch`/`.extern` sub-rows and array-task rows per job
+  id, and appends the observed terminal state plus `Elapsed` and peak `MaxRSS`.
+  Only `COMPLETED` is success; every other terminal state is resubmit-eligible.
+- **submit** reconciles first, then runs only nodes whose latest state is not
+  `COMPLETED` — failed, invalidated, absent, or force-listed — plus every node
+  **downstream** of a rerun (its inputs are now stale). Live nodes
+  (`RUNNING`/`PENDING`/just-`SUBMITTED`) are left untouched. Skipped `COMPLETED`
+  nodes keep their logged job id so downstream `afterok`/`aftercorr` can still
+  target them.
+- **`--only <glob>`** restricts the run to matching nodes only — no downstream,
+  no unrelated branches. It does **not** run their upstream; instead it requires
+  each matched node's parents to be already `COMPLETED` or themselves in the run,
+  and errors (running nothing) otherwise. `--rerun`/skip-completed still apply
+  within the scope, so `--only` composes with them.
+- **`--rerun <glob>`** (transient) force-resubmits nodes whose identity matches,
+  in this invocation only.
+- **`invalidate <glob>`** (persistent) appends an `INVALIDATED` record for
+  matching nodes, so the next `submit` — in any session — reruns them and their
+  downstream. Cleared naturally once a node re-runs to `COMPLETED`.
+
+- **`--local`** (used by `cc-local`) marks the runner **synchronous**: the job
+  runs to completion during submission, so the engine logs its terminal state
+  (`COMPLETED`/`FAILED`) directly from the runner's exit and **skips `sacct`
+  entirely**. Anything not `COMPLETED` (including a stale `SUBMITTED` from an
+  interrupted local run) is rerun. This is what makes `status` on a
+  locally-run pipeline need no cluster access.
+
+Array units reconcile atomically: an array is `COMPLETED` only if all its tasks
+are, else the whole array is resubmit-eligible. (Per-task array resubmission via
+sparse `--array=` indices is a possible future refinement.)
+
+**Subcommands:** `dag`, `dry`, `submit` (`--rerun <glob>`), `status`,
+`invalidate <glob>`.
 
 ---
 

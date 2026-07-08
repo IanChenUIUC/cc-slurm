@@ -18,19 +18,22 @@ default:
 dag spec=spec:
     python3 pipeline.py dag {{spec}}
 
-# Print the exact cc-submit commands that WOULD run (placeholder ids).
+# Print the cc-submit commands that WOULD run, and materialize the scripts
+# into .pipeline/scripts/ for inspection (placeholder ids; nothing submitted).
 dry spec=spec:
     python3 pipeline.py dry {{spec}}
 
 # ---- running ---------------------------------------------------------------
 
 # Reconcile, then submit failed/absent nodes (+ downstream) to SLURM.
-run spec=spec:
-    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_submit}}' --sacct '{{sacct}}'
+# Optional GLOB restricts the run to matching nodes (their upstream must be done).
+run spec=spec glob='*':
+    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_submit}}' --sacct '{{sacct}}' --only '{{glob}}'
 
 # Same, but run jobs locally in the container via cc-local (no SLURM).
-local spec=spec:
-    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_local}}' --sacct '{{sacct}}'
+# Synchronous: jobs are logged COMPLETED/FAILED directly, sacct is not consulted.
+local spec=spec glob='*':
+    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_local}}' --local --only '{{glob}}'
 
 # Force-resubmit nodes matching GLOB this run only (transient), then submit.
 rerun glob spec=spec:
