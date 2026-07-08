@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# cc-local: a local, synchronous drop-in for `cc-submit`.
+#
+# Runs jobs immediately on this machine (inside the same apptainer container the
+# cluster wrappers use) instead of submitting to SLURM, so you can exercise a
+# pipeline or run genuinely small jobs without the cluster.
+#
+#   pipeline.py submit spec.toml --cc-submit ./cc-local
+#
+# It mirrors cc-submit's interface: subcommands `sbatch` / `array`, the flags
+# -j/-d/-C/-c/-m/-p/-t, and a job id printed on stdout. Dependency flags
+# (-d afterok, -C aftercorr) are accepted and IGNORED: the engine submits in
+# topological order and cc-local blocks until each job finishes, so a child
+# never starts before its parents are done. Resource flags are ignored too.
+#
+# Job stdout+stderr go to a per-job log file (like SLURM's slurm-*.out), keeping
+# this script's stdout clean (just the id). A failing job exits non-zero, which
+# halts `pipeline.py submit` — the local analogue of an unmet afterok.
+set -uo pipefail
+
+CMD="${1:-}"; shift || true
+
+name=""
+pos=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -j|--job-name)      name="${2:-}"; shift 2 ;;
+    -d|--depends-on)    shift 2 ;;     # ignored: topo order guarantees ordering
+    -C|--aftercorr)     shift 2 ;;     # ignored
+    -c|--cpus-per-task) shift 2 ;;     # ignored
+    -m|--mem)           shift 2 ;;     # ignored
+    -p|--partition)     shift 2 ;;     # ignored
+    -t|--time)          shift 2 ;;     # ignored
+    --) shift ;;
+    -*) shift ;;                       # unknown flag: skip
+    *)  pos+=("$1"); shift ;;
+  esac
+done
+
+LOGDIR="${CC_LOCAL_LOGDIR:-.pipeline/local-logs}"
+mkdir -p "$LOGDIR"
+id=$$                                   # a unique-enough "job id" for the log
+
+case "$CMD" in
+  sbatch)
+    script="${pos[0]}"
+    args=("${pos[@]:1}")
+    out="$LOGDIR/${name:-job}.$id.out"
+    echo "[cc-local] ${name:-$script} -> $out" >&2
+    bash "$script" "${args[@]}" > "$out" 2>&1 || {
+      rc=$?; echo "[cc-local] FAILED (exit $rc): $out" >&2; exit $rc; }
+    ;;
+  array)
+    cmdfile="${pos[0]}"
+    echo "[cc-local] array ${name:-$cmdfile}" >&2
+    i=0; rc_all=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -z "$line" ] && continue
+      out="$LOGDIR/${name:-array}.$id.$i.out"
+      bash -c "$line" > "$out" 2>&1 || {
+        rc=$?; echo "[cc-local] array task $i FAILED (exit $rc): $out" >&2; rc_all=$rc; }
+      i=$((i+1))
+    done < "$cmdfile"
+    [ "$rc_all" -eq 0 ] || exit "$rc_all"
+    ;;
+  *)
+    echo "cc-local: unknown subcommand: ${CMD:-<none>}" >&2; exit 2 ;;
+esac
+
+echo "$id"

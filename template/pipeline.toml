@@ -1,0 +1,23 @@
+[defaults.slurm]
+cpus = 1
+mem  = "16GB"
+time = "4:00:00"
+partition = "secondary"
+
+[defaults]
+indir = "/scratch/ianchen3/xxxx/input"
+outdir = "/scratch/ianchen3/xxxx/output"
+
+[recipe.xxx]
+stdout  = "${outdir}/${dataset}.out"
+stderr  = "${outdir}/${dataset}.err"
+timing  = "${outdir}/${dataset}.resources"
+
+params  = { dataset = ["alpha", "beta"], method = ["hello", "world"] }
+command = """
+  mkdir -p ${outdir}
+  /usr/bin/time -v -o ${timing} bash -c "
+    echo to stdout >&1
+    echo to stderr >&2 
+  " > ${stdout} 2> ${stderr}
+"""
