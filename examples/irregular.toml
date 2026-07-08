@@ -1,0 +1,50 @@
+[defaults.slurm]
+cpus = 8
+mem  = "16GB"
+
+# cluster: jagged record list. Each record on ONE line -> valid inline tables.
+[recipe.cluster]
+params = [
+  { dataset = "web",      method = "metis" },
+  { dataset = "web",      method = "pulp", resolution = "0.1" },
+  { dataset = "web",      method = "pulp", resolution = "0.5" },
+  { dataset = "web",      method = "pulp", resolution = "1.0" },
+  { dataset = "web-huge", method = "louvain" },
+  { dataset = "web-huge", method = "leiden" },
+  { dataset = "web-huge", method = "pulp", resolution = "0.5" },
+]
+command = "./cluster ${dataset} ${method} ${output}"
+output  = "results/${dataset}.${method}.clust"
+
+# ensemble: record list as array-of-tables so `sources` can span lines.
+[recipe.ensemble]
+deps    = ["${sources}"]
+command = "./ensemble --inputs ${sources.output} --out ${output}"
+output  = "results/${dataset}.${name}.ens.csv"
+
+[[recipe.ensemble.params]]
+dataset = "web"
+name    = "pulp-lohi"
+sources = [
+  "cluster(dataset=web, method=pulp, resolution=0.1)",
+  "cluster(dataset=web, method=pulp, resolution=1.0)",
+]
+
+[[recipe.ensemble.params]]
+dataset = "web"
+name    = "cross"
+slurm   = { mem = "128GB" }
+sources = [
+  "cluster(dataset=web, method=metis)",
+  "cluster(dataset=web, method=pulp, resolution=0.5)",
+]
+
+[[recipe.ensemble.params]]
+dataset = "web-huge"
+name    = "triple"
+slurm   = { cpus = 32, mem = "512GB" }
+sources = [
+  "cluster(dataset=web-huge, method=louvain)",
+  "cluster(dataset=web-huge, method=leiden)",
+  "cluster(dataset=web-huge, method=pulp, resolution=0.5)",
+]

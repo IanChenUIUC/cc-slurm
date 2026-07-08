@@ -1,0 +1,22 @@
+[defaults.slurm]
+cpus = 1
+mem  = "1GB"
+
+[defaults]
+outdir = "out"
+
+[recipe.convert]
+params  = { dataset = ["alpha", "beta"] }
+command = "mkdir -p ${outdir} && echo convert ${dataset} && echo done > ${output}"
+output  = "${outdir}/${dataset}.bin"
+
+[recipe.analyze]
+params  = { dataset = ["alpha", "beta"], method = ["fast", "slow"] }
+deps    = ["convert(dataset=${dataset})"]
+command = "mkdir -p ${outdir} && echo analyze ${dataset}/${method} from ${convert.output} && echo r > ${output}"
+output  = "${outdir}/${dataset}.${method}.txt"
+
+[recipe.summarize]
+params  = { dataset = ["alpha", "beta"] }
+deps    = ["analyze(dataset=${dataset}, method=*)"]
+command = "echo summarize ${dataset} over ${analyze.output}"

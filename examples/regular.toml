@@ -1,0 +1,23 @@
+[defaults.slurm]
+cpus = 16
+mem  = "64GB"
+
+[defaults]
+resultdir = "results"
+
+[recipe.convert]
+params  = { dataset = ["cora", "citeseer", "pubmed"] }
+command = "./convert data/${dataset}.raw ${output}"
+output  = "out/${dataset}.bin"
+
+[recipe.partition]
+params  = { dataset = ["cora", "citeseer", "pubmed"], method = ["metis", "pulp"] }
+deps    = ["convert(dataset=${dataset})"]
+command = "./partition --method ${method} ${convert.output} ${output}"
+output  = "out/${dataset}.${method}.parts"
+
+[recipe.cluster]
+params  = { dataset = ["cora", "citeseer", "pubmed"], method = ["metis", "pulp"] }
+deps    = ["partition(dataset=${dataset}, method=${method})"]
+command = "./cluster ${partition.output} ${output}"
+output  = "${resultdir}/${dataset}.${method}.csv"

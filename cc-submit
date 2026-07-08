@@ -1,0 +1,203 @@
+#!/usr/bin/env python
+
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+import time
+
+import click
+
+WORKING_DIRECTORY = "/u/ianchen3/scratch"
+SLURM_SCRIPTS = "/u/ianchen3/slurm_scripts"
+
+help = """
+Wrapper script for submitting and managing Slurm jobs.
+
+\b
+EXAMPLES OF USAGE:
+  # 1. Launch interactive mode
+  python submit.py srun
+
+  # 2. Run a standard single job
+  python submit.py sbatch script.sh arg1 -j "My Job" -c 16 -m 64GB
+
+  # 3. Run an array of jobs from a commands file
+  python submit.py array commands.txt -j "My Array" -c 16 -m 64GB
+"""
+
+
+def build_dependency(afterok=(), aftercorr=()):
+    """Compose a Slurm --dependency value. afterok/aftercorr are iterables of
+    job tokens (each an id, an array id, or an <arrayid>_<idx> element).
+    Multiple clauses are ANDed with a comma. Returns '' if no deps."""
+    clauses = []
+    ok = [t for t in afterok if t]
+    corr = [t for t in aftercorr if t]
+    if ok:
+        clauses.append("afterok:" + ":".join(ok))
+    if corr:
+        clauses.append("aftercorr:" + ":".join(corr))
+    return ",".join(clauses)
+
+
+def _upload(path):
+    """scp a local file to a fresh remote temp dir. Returns (tmp_dir, fname)."""
+    path = pathlib.Path(path)
+    fname = path.name
+    tmp_dir = f"tmp/{int(time.time())}"
+    remote_tmp_path = f"{WORKING_DIRECTORY}/{tmp_dir}"
+
+    click.echo(f"\nCreating remote temp directory: {remote_tmp_path}...", err=True)
+    subprocess.run(
+        ["ssh", "cc", f"mkdir -p {shlex.quote(remote_tmp_path)}"], check=True
+    )
+
+    click.echo(f"Uploading {fname} to cluster...", err=True)
+    subprocess.run(["scp", str(path), f"cc:{remote_tmp_path}/{fname}"], check=True)
+    return tmp_dir, fname
+
+
+def _run_remote_sbatch(sbatch_cmd):
+    """Run an sbatch command line on the cluster and return the parsed job id.
+
+    The remote command is passed to ssh as a single argv element (list-form, no
+    local shell), so the remote login shell parses exactly one quoting layer —
+    avoiding the nested `bash -c '... '<quoted>' ...'` breakage on values that
+    contain spaces."""
+    remote = f"cd {shlex.quote(WORKING_DIRECTORY)} && {sbatch_cmd}"
+    click.echo(f"\nExecuting: ssh cc {shlex.quote(remote)}", err=True)
+    process = subprocess.run(["ssh", "cc", remote], capture_output=True, text=True)
+    if process.returncode != 0:
+        click.echo(f"SSH/Slurm Error:\n{process.stderr}", err=True)
+        sys.exit(process.returncode)
+    out = process.stdout.strip()
+    job_id = out.split()[-1] if out else ""
+    click.echo(job_id)
+    return job_id
+
+
+@click.group(help=help)
+def cli():
+    """Wrapper script for submitting and managing Slurm jobs."""
+
+
+@cli.command()
+@click.option("--partition", "-p", default="secondary")
+@click.option("--cpus-per-task", "-c", default=16)
+@click.option("--mem", "-m")
+@click.option("--time", "-t", "walltime", default="4:00:00")
+@click.option("--nodes", default=1)
+@click.option("--ntasks", default=1)
+def srun(partition, cpus_per_task, mem, walltime, nodes, ntasks):
+    """Launch an interactive Slurm job."""
+    opts = []
+    if mem:
+        opts.append(f"--mem={shlex.quote(mem)}")
+    opts = " ".join(opts)
+
+    srun_cmd = (
+        f"srun {opts} --job-name=interactive "
+        f"--partition={shlex.quote(str(partition))} --time={shlex.quote(str(walltime))} "
+        f"--nodes={nodes} --ntasks={ntasks} --cpus-per-task={cpus_per_task} "
+        f"--pty /bin/bash"
+    )
+    click.echo(
+        f"Starting interactive session...\nExecuting: ssh -t cc {shlex.quote(srun_cmd)}"
+    )
+    subprocess.run(["ssh", "-t", "cc", srun_cmd])
+
+
+@cli.command()
+@click.argument("script", default="", type=click.Path(exists=True))
+@click.argument("script_args", nargs=-1)
+@click.option("--job-name", "-j")
+@click.option("--depends-on", "-d", multiple=True)
+@click.option("--cpus-per-task", "-c")
+@click.option("--partition", "-p")
+@click.option("--mem", "-m")
+@click.option("--time", "-t", "walltime")
+def sbatch(
+    script, script_args, job_name, depends_on, cpus_per_task, partition, mem, walltime
+):
+    """Run an sbatch job by uploading a local script to the cluster."""
+    tmp_dir, fname = _upload(script)
+
+    opts = []
+    if job_name:
+        opts.append(f"--job-name={shlex.quote(job_name)}")
+    dep = build_dependency(afterok=depends_on)
+    if dep:
+        opts.append(f"--dependency={dep}")
+    if cpus_per_task:
+        opts.append(f"--cpus-per-task={shlex.quote(str(cpus_per_task))}")
+    if partition:
+        opts.append(f"--partition={shlex.quote(partition)}")
+    if mem:
+        opts.append(f"--mem={shlex.quote(mem)}")
+    if walltime:
+        opts.append(f"--time={shlex.quote(walltime)}")
+    opts = " ".join(opts)
+
+    args = " ".join(shlex.quote(a) for a in script_args)
+    sbatch_cmd = f"sbatch {opts} {SLURM_SCRIPTS}/run.sbatch.sh {tmp_dir}/{fname} {args}"
+    _run_remote_sbatch(sbatch_cmd)
+
+
+@cli.command()
+@click.argument("commands_file", default="", type=click.Path())
+@click.option("--job-name", "-j")
+@click.option("--depends-on", "-d", multiple=True, help="afterok dependency tokens")
+@click.option("--aftercorr", "-C", multiple=True, help="aftercorr array tokens")
+@click.option("--cpus-per-task", "-c")
+@click.option("--partition", "-p")
+@click.option("--mem", "-m")
+@click.option("--time", "-t", "walltime")
+def array(
+    commands_file,
+    job_name,
+    depends_on,
+    aftercorr,
+    cpus_per_task,
+    partition,
+    mem,
+    walltime,
+):
+    """Submit an array job reading one command per line from a commands file."""
+    if not commands_file:
+        commands_file = click.prompt(
+            "Enter the path to the commands txt file", type=click.Path(exists=True)
+        )
+    if not os.path.exists(commands_file):
+        click.echo(f"No such file: {commands_file}", err=True)
+        sys.exit(1)
+
+    with open(commands_file) as f:
+        n_cmds = sum(1 for line in f if line.strip())
+
+    tmp_dir, fname = _upload(commands_file)
+
+    opts = []
+    if job_name:
+        opts.append(f"--job-name={shlex.quote(job_name)}")
+    opts.append(f"--array=0-{n_cmds - 1}")
+    dep = build_dependency(afterok=depends_on, aftercorr=aftercorr)
+    if dep:
+        opts.append(f"--dependency={dep}")
+    if cpus_per_task:
+        opts.append(f"--cpus-per-task={shlex.quote(str(cpus_per_task))}")
+    if partition:
+        opts.append(f"--partition={shlex.quote(partition)}")
+    if mem:
+        opts.append(f"--mem={shlex.quote(mem)}")
+    if walltime:
+        opts.append(f"--time={shlex.quote(walltime)}")
+    opts = " ".join(opts)
+
+    sbatch_cmd = f"sbatch {opts} {SLURM_SCRIPTS}/array.sbatch.sh {tmp_dir}/{fname}"
+    _run_remote_sbatch(sbatch_cmd)
+
+
+if __name__ == "__main__":
+    cli()
