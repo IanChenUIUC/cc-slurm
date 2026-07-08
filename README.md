@@ -18,6 +18,21 @@ Using the `just` command runner is easy, and can understand the subcommands.
 - run: submits all jobs
 - status: shows the status of all jobs
 
+The `template.zip` contains the files that can be copied into any project.
+```
+template
+├── cc-local
+├── cc-submit
+├── justfile
+├── pipeline.py
+└── pipeline.toml
+```
+so that new projects can, for example, start with
+```
+wget https://github.com/IanChenUIUC/cc-slurm/raw/refs/heads/main/template.zip &&
+unzip -j template.zip -d slurm && rm template.zip
+```
+
 ## Overview
 
 There are three different systems in play:
