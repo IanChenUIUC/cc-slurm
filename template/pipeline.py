@@ -32,7 +32,7 @@ RUNNINGISH = {"RUNNING", "PENDING", "REQUEUED", "SUSPENDED",
               "COMPLETING", "CONFIGURING", "RESIZING"}
 NON_TERMINAL = RUNNINGISH | {"SUBMITTED", "UNKNOWN"}
 VAR = re.compile(r"\$\{([^}]+)\}")
-CAP = re.compile(r"^(\w+)\s*\((.*)\)\s*$")
+CAP = re.compile(r"^([\w-]+)\s*\((.*)\)\s*$")   # recipe names are TOML bare keys (may contain '-')
 
 
 class PipelineError(Exception):
@@ -138,7 +138,7 @@ class Engine:
         out = []
         for entry in node.rdef.get("deps", []):
             s = entry.strip()
-            m = re.fullmatch(r"\$\{(\w+)\}", s)
+            m = re.fullmatch(r"\$\{([\w-]+)\}", s)
             if m and isinstance(node.binding.get(m.group(1)), list):
                 out.extend(node.binding[m.group(1)])          # splice list of captures
             else:
@@ -181,7 +181,7 @@ class Engine:
         cap = cap.strip()
         m = CAP.match(cap)
         if not m:
-            if re.fullmatch(r"\w+", cap):
+            if re.fullmatch(r"[\w-]+", cap):
                 return cap, {}
             raise PipelineError(f"malformed capture: {cap!r}")
         recipe, body = m.group(1), m.group(2).strip()
