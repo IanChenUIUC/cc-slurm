@@ -59,6 +59,23 @@ def _upload(path):
     return tmp_dir, fname
 
 
+def _upload_dir(path):
+    """scp -r a local directory to a fresh remote temp dir. Returns (tmp_dir, dirname)."""
+    path = pathlib.Path(path)
+    dirname = path.name
+    tmp_dir = f"tmp/{int(time.time())}"
+    remote_tmp_path = f"{WORKING_DIRECTORY}/{tmp_dir}"
+
+    click.echo(f"\nCreating remote temp directory: {remote_tmp_path}...", err=True)
+    subprocess.run(
+        ["ssh", "cc", f"mkdir -p {shlex.quote(remote_tmp_path)}"], check=True
+    )
+
+    click.echo(f"Uploading {dirname}/ to cluster...", err=True)
+    subprocess.run(["scp", "-r", str(path), f"cc:{remote_tmp_path}/{dirname}"], check=True)
+    return tmp_dir, dirname
+
+
 def _run_remote_sbatch(sbatch_cmd):
     """Run an sbatch command line on the cluster and return the parsed job id.
 
@@ -146,7 +163,7 @@ def sbatch(
 
 
 @cli.command()
-@click.argument("commands_file", default="", type=click.Path())
+@click.argument("tasks_dir", default="", type=click.Path())
 @click.option("--job-name", "-j")
 @click.option("--depends-on", "-d", multiple=True, help="afterok dependency tokens")
 @click.option("--aftercorr", "-C", multiple=True, help="aftercorr array tokens")
@@ -155,7 +172,7 @@ def sbatch(
 @click.option("--mem", "-m")
 @click.option("--time", "-t", "walltime")
 def array(
-    commands_file,
+    tasks_dir,
     job_name,
     depends_on,
     aftercorr,
@@ -164,19 +181,25 @@ def array(
     mem,
     walltime,
 ):
-    """Submit an array job reading one command per line from a commands file."""
-    if not commands_file:
-        commands_file = click.prompt(
-            "Enter the path to the commands txt file", type=click.Path(exists=True)
+    """Submit an array job from a tasks directory of per-task scripts.
+
+    The directory holds one `task-<i>.sh` per array index (i = 0..N-1); each
+    script is a full, possibly multi-line command run intact by
+    `array.sbatch.sh`. Task count is the number of such scripts."""
+    if not tasks_dir:
+        tasks_dir = click.prompt(
+            "Enter the path to the tasks directory", type=click.Path(exists=True)
         )
-    if not os.path.exists(commands_file):
-        click.echo(f"No such file: {commands_file}", err=True)
+    if not os.path.isdir(tasks_dir):
+        click.echo(f"No such directory: {tasks_dir}", err=True)
         sys.exit(1)
 
-    with open(commands_file) as f:
-        n_cmds = sum(1 for line in f if line.strip())
+    n_cmds = len(list(pathlib.Path(tasks_dir).glob("task-*.sh")))
+    if n_cmds == 0:
+        click.echo(f"No task-*.sh scripts in: {tasks_dir}", err=True)
+        sys.exit(1)
 
-    tmp_dir, fname = _upload(commands_file)
+    tmp_dir, dirname = _upload_dir(tasks_dir)
 
     opts = []
     if job_name:
@@ -195,7 +218,7 @@ def array(
         opts.append(f"--time={shlex.quote(walltime)}")
     opts = " ".join(opts)
 
-    sbatch_cmd = f"sbatch {opts} {SLURM_SCRIPTS}/array.sbatch.sh {tmp_dir}/{fname}"
+    sbatch_cmd = f"sbatch {opts} {SLURM_SCRIPTS}/array.sbatch.sh {tmp_dir}/{dirname}"
     _run_remote_sbatch(sbatch_cmd)
 
 

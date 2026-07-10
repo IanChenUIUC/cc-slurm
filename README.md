@@ -47,3 +47,18 @@ Finally, the compute node must have the `CONTAINER`, as specified in the `*.sbat
 
 For short testing runs on the login node, entering the `CONTIANER`, running `just local` with bypass the SLURM scheduler and run jobs directly.
 Otherwise, figuring out what will be run using `just dry` and `just dag` commands, and then `just status`.
+
+## How commands are materialized
+
+`just dry`/`just run` write the resolved, per-node `command` under `.pipeline/scripts/`:
+
+- **Individual jobs** → one script `<node>.sh`, uploaded and run by `run.sbatch.sh` (`bash <script>`).
+- **Array recipes** (`array = true`) → a directory `<recipe>.tasks/` holding one
+  script per task, `task-<idx>.sh`, where `idx` is the node's array index. The
+  whole directory is uploaded and `array.sbatch.sh` runs task *i* via
+  `bash <dir>/task-$SLURM_ARRAY_TASK_ID.sh`.
+
+Because every task is its own script, a `command` may span multiple lines (multiple
+statements, heredocs, `\`-continuations) and runs intact — the same as an individual
+job. Accordingly, `cc-submit array` takes the **tasks directory** (not a one-line-per-command
+file) and sizes `--array` from the number of `task-*.sh` scripts in it.

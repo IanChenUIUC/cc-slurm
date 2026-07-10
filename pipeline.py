@@ -419,11 +419,19 @@ class Engine:
         if u.kind == "individual":
             p = sdir / f"{u.name}.sh"
             p.write_text("#!/bin/bash\nset -euo pipefail\n" + (u.nodes[0].command or "") + "\n")
-        else:
-            p = sdir / f"{u.name}.cmds"
-            p.write_text("".join((n.command or "") + "\n"
-                                 for n in sorted(u.nodes, key=self._sortkey)))
-        return p
+            return p
+        # Array: one script per task, mirroring the individual path, so a task's
+        # command runs intact no matter how many lines it spans. The filename is
+        # keyed on array_index (the authoritative task<->node map from _build),
+        # so SLURM task i always runs node i's full command.
+        tdir = sdir / f"{u.name}.tasks"
+        tdir.mkdir(parents=True, exist_ok=True)
+        for old in tdir.glob("task-*.sh"):     # clear stale scripts from a prior run
+            old.unlink()
+        for n in u.nodes:
+            (tdir / f"task-{n.array_index}.sh").write_text(
+                "#!/bin/bash\nset -euo pipefail\n" + (n.command or "") + "\n")
+        return tdir
 
     def _invoke_cc(self, cc, u, wd):
         cmd = self._cmd(u, lambda x: x.job_id, str(self._materialize(u, wd)))

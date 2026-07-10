@@ -10,14 +10,16 @@
 set -euo pipefail
 
 CONTAINER=/u/ianchen3/venv/python_bootstrap-sandbox
-CMDFILE="$1"
+CMDDIR="$1"
 
-# Pick this task's line (0-indexed array -> 1-indexed sed).
-LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$CMDFILE")
-if [ -z "$LINE" ]; then
-  echo "no command at array index $SLURM_ARRAY_TASK_ID in $CMDFILE" >&2
+# Each task is its own script (task-<idx>.sh), so a task's command runs intact
+# regardless of how many lines it spans.
+SCRIPT="$CMDDIR/task-${SLURM_ARRAY_TASK_ID}.sh"
+if [ ! -f "$SCRIPT" ]; then
+  echo "no task script for array index $SLURM_ARRAY_TASK_ID in $CMDDIR" >&2
   exit 1
 fi
 
-# Run the (already bash -c wrapped) command line inside the container.
-exec apptainer exec "$CONTAINER" bash -c "$LINE"
+# Run this task's script inside the container, exactly like run.sbatch.sh does
+# for individual jobs.
+exec apptainer exec "$CONTAINER" bash "$SCRIPT"

@@ -200,8 +200,10 @@ resolve with three-level precedence, per flag, highest wins:
 
 `command` is the shell run per node, interpolated per node (§4). The engine
 materializes it: individual nodes → an uploaded script run by `run.sbatch.sh`;
-array recipes → one line per task in an uploaded commands file, each line run by
-`array.sbatch.sh`. Both wrapper scripts invoke the command through `bash` inside
+array recipes → one script per task (`task-<idx>.sh`) in an uploaded tasks
+directory, task *i* run by `array.sbatch.sh` off `$SLURM_ARRAY_TASK_ID`. Because
+each task is its own script, a `command` may span multiple lines and runs intact
+— identical to the individual path. Both wrapper scripts invoke the command through `bash` inside
 the container, so `command` stays free-form shell (pipes, redirects, `&&`) and
 needs **no `bash -c` wrapping by the author**. The engine passes `command`
 through verbatim — it is never word-split; quoting *within* it is the author's
