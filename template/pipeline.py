@@ -356,13 +356,25 @@ class Engine:
                 return False
         return True
 
-    def _dep_tokens(self, u, uid):
-        """Return (afterok_tokens, aftercorr_tokens). `uid` maps a unit to its id."""
+    def _dep_tokens(self, u, uid, keep=None):
+        """Return (afterok_tokens, aftercorr_tokens). `uid` maps a unit to its id.
+
+        `keep`, if given, is the set of parent units whose edge should actually be
+        emitted this run — units being (re)submitted now (fresh id) or still live
+        (id still valid). A parent that already COMPLETED and was skipped is NOT
+        in `keep`: its output exists on disk and its ordering is already satisfied,
+        so emitting `afterok:<its old id>` is both unnecessary and rejected by
+        SLURM once that job ages out of the controller. `keep=None` emits every
+        edge (structural view, for `dag`/`dry`)."""
+        def use(pu):
+            return keep is None or pu in keep
         afterok, aftercorr = [], []
         if u.kind == "individual":
             n = u.nodes[0]
             for p in n.parents:
                 pu = self.node_unit[p]
+                if not use(pu):
+                    continue
                 if pu.kind == "individual":
                     afterok.append(uid(pu))
                 else:
@@ -372,15 +384,18 @@ class Engine:
             for R in parent_recipes:
                 if self._is_array(R):
                     pu = self.array_unit[R]
+                    if not use(pu):
+                        continue
                     (aftercorr if self._aligned(u, pu) else afterok).append(uid(pu))
                 else:
-                    pids = sorted({uid(self.node_unit[p])
-                                   for n in u.nodes for p in n.parents if p.recipe == R})
+                    pids = sorted({uid(pu)
+                                   for n in u.nodes for p in n.parents if p.recipe == R
+                                   for pu in [self.node_unit[p]] if use(pu)})
                     afterok.extend(pids)
         return afterok, aftercorr
 
-    def _cmd(self, u, uid, script):
-        afterok, aftercorr = self._dep_tokens(u, uid)
+    def _cmd(self, u, uid, script, keep=None):
+        afterok, aftercorr = self._dep_tokens(u, uid, keep)
         deps = " ".join(f"-d {t}" for t in afterok)
         deps += ("" if not aftercorr else " " + " ".join(f"-C {t}" for t in aftercorr))
         flags = " ".join(f"{SLURM_FLAGS[k]} {shlex.quote(str(n.slurm[k]))}"
@@ -433,8 +448,8 @@ class Engine:
                 "#!/bin/bash\nset -euo pipefail\n" + (n.command or "") + "\n")
         return tdir
 
-    def _invoke_cc(self, cc, u, wd):
-        cmd = self._cmd(u, lambda x: x.job_id, str(self._materialize(u, wd)))
+    def _invoke_cc(self, cc, u, wd, keep=None):
+        cmd = self._cmd(u, lambda x: x.job_id, str(self._materialize(u, wd)), keep)
         parts = shlex.split(cc) + cmd.split()[1:]      # replace leading 'cc-submit'
         return subprocess.run(parts, capture_output=True, text=True)
 
@@ -645,6 +660,15 @@ class Engine:
             if u not in torun:
                 u.job_id = (state.get(u.name) or {}).get("job_id")
 
+        # A dependency edge is only valid/needed for a parent that is part of this
+        # wave (fresh id) or still live (id still known to slurmctld). A parent that
+        # already COMPLETED and is skipped has its output on disk and its old job id
+        # may have aged out of the controller, so targeting it errors ("Job
+        # dependency problem"); drop those edges.
+        live = {u for u in self.units
+                if (state.get(u.name) or {}).get("state") in NON_TERMINAL}
+        keep = torun | live
+
         def record(u, jid, st):
             return json.dumps({"unit": u.name, "kind": u.kind, "job_id": jid, "state": st,
                                "nodes": [n.ident for n in u.nodes], "time": time.time()}) + "\n"
@@ -652,7 +676,7 @@ class Engine:
         with open(log_path, "a") as log:
             for u in self.unit_order:
                 if u in torun:
-                    proc = self._invoke_cc(cc, u, wd)
+                    proc = self._invoke_cc(cc, u, wd, keep)
                     jid = proc.stdout.strip().split()[-1] if proc.stdout.strip() else None
                     if proc.returncode != 0:
                         if local:                     # record the failure before aborting

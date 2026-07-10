@@ -308,9 +308,11 @@ The append-only JSONL log is the project's memory; `sacct` is SLURM's. Both
 - **submit** reconciles first, then runs only nodes whose latest state is not
   `COMPLETED` — failed, invalidated, absent, or force-listed — plus every node
   **downstream** of a rerun (its inputs are now stale). Live nodes
-  (`RUNNING`/`PENDING`/just-`SUBMITTED`) are left untouched. Skipped `COMPLETED`
-  nodes keep their logged job id so downstream `afterok`/`aftercorr` can still
-  target them.
+  (`RUNNING`/`PENDING`/just-`SUBMITTED`) are left untouched. A dependency edge is emitted only for a parent that is
+(re)submitted in the same run (fresh job id) or still live (id still known to the
+controller); a skipped `COMPLETED` parent is **not** targeted — its output
+already exists and its old job id may have aged out of `slurmctld`, which would
+otherwise make SLURM reject the submission ("Job dependency problem").
 - **`--only <glob>`** restricts the run to matching nodes only — no downstream,
   no unrelated branches. It does **not** run their upstream; instead it requires
   each matched node's parents to be already `COMPLETED` or themselves in the run,
