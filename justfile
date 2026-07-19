@@ -55,6 +55,11 @@ status spec=spec:
 invalidate glob spec=spec:
     python3 pipeline.py invalidate {{spec}} '{{glob}}'
 
+# Force nodes matching GLOB to COMPLETED (e.g. after a manual re-run); `run` then
+# skips them and won't re-propagate downstream. Undone by a later invalidate/rerun.
+complete glob spec=spec:
+    python3 pipeline.py complete {{spec}} '{{glob}}'
+
 # ---- utilities -------------------------------------------------------------
 
 # Tail the SLURM (remote) and local output logs for nodes matching GLOB.

@@ -630,6 +630,35 @@ class Engine:
                                     "time": time.time()}) + "\n")
                 print(f"invalidated {u.name}")
 
+    def complete(self, globs, workdir=".pipeline"):
+        """Append COMPLETED records for matching nodes, forcing them to success
+        (e.g. after manually re-running a failed job). COMPLETED is terminal, so
+        reconcile won't re-query sacct and submit will skip the node and won't
+        re-propagate downstream. The prior job_id is carried so `logs`/`cancel`
+        still resolve; a later `invalidate`/`rerun` overrides this normally."""
+        wd = pathlib.Path(workdir)
+        wd.mkdir(parents=True, exist_ok=True)
+        log_path = wd / "run.jsonl"
+        last = {}
+        if log_path.exists():
+            for ln in log_path.read_text().splitlines():
+                if ln.strip():
+                    r = json.loads(ln)
+                    last[r["unit"]] = r
+        matched = [u for u in self.units
+                   if any(fnmatch.fnmatch(n.ident, g) for g in globs for n in u.nodes)]
+        if not matched:
+            print("complete: no nodes matched", file=sys.stderr)
+            return
+        with open(log_path, "a") as f:
+            for u in matched:
+                f.write(json.dumps({"unit": u.name, "kind": u.kind,
+                                    "job_id": (last.get(u.name) or {}).get("job_id"),
+                                    "state": "COMPLETED",
+                                    "nodes": [n.ident for n in u.nodes],
+                                    "time": time.time()}) + "\n")
+                print(f"completed {u.name}")
+
     # ---- submit: reconcile, then run only failed/absent (+ --rerun, downstream) ----
     def submit(self, cc, sacct="sacct", workdir=".pipeline", rerun=(), only=(), local=False):
         wd = pathlib.Path(workdir)
@@ -726,9 +755,10 @@ class Unit:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["dag", "dry", "submit", "status", "invalidate",
-                                       "cancel-ids", "log-ids"])
+                                       "complete", "cancel-ids", "log-ids"])
     ap.add_argument("spec")
-    ap.add_argument("globs", nargs="*", help="node-identity globs (for invalidate / log-ids)")
+    ap.add_argument("globs", nargs="*",
+                    help="node-identity globs (for invalidate / complete / log-ids)")
     ap.add_argument("--cc-submit", default="cc-submit")
     ap.add_argument("--sacct", default="sacct")
     ap.add_argument("--rerun", action="append", default=[],
@@ -753,6 +783,8 @@ def main():
             eng.status(sacct=args.sacct)
         elif args.action == "invalidate":
             eng.invalidate(args.globs)
+        elif args.action == "complete":
+            eng.complete(args.globs)
         elif args.action == "cancel-ids":
             eng.cancel_ids()
         elif args.action == "log-ids":
