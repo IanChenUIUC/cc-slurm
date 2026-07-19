@@ -8,6 +8,7 @@ cc_submit  := "./cc-submit"
 cc_local   := "bash ./cc-local"
 sacct      := "ssh cc sacct"
 workdir    := ".pipeline"
+slurmlog   := "/scratch/ianchen3/slurm"
 
 default:
     @just --list
@@ -27,17 +28,22 @@ dry spec=spec:
 
 # Reconcile, then submit failed/absent nodes (+ downstream) to SLURM.
 # Optional GLOB restricts the run to matching nodes (their upstream must be done).
-run spec=spec glob='*':
+run glob='*' spec=spec:
     python3 pipeline.py submit {{spec}} --cc-submit '{{cc_submit}}' --sacct '{{sacct}}' --only '{{glob}}'
 
 # Same, but run jobs locally in the container via cc-local (no SLURM).
 # Synchronous: jobs are logged COMPLETED/FAILED directly, sacct is not consulted.
-local spec=spec glob='*':
+local glob='*' spec=spec:
     python3 pipeline.py submit {{spec}} --cc-submit '{{cc_local}}' --local --only '{{glob}}'
 
 # Force-resubmit nodes matching GLOB this run only (transient), then submit.
 rerun glob spec=spec:
     python3 pipeline.py submit {{spec}} --cc-submit '{{cc_submit}}' --sacct '{{sacct}}' --rerun '{{glob}}'
+
+# Force-resubmit nodes matching GLOB, WITHOUT re-propagating to downstream nodes
+# (upstream must already be COMPLETED). Like `rerun` but scoped to GLOB only.
+force glob spec=spec:
+    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_submit}}' --sacct '{{sacct}}' --only '{{glob}}' --rerun '{{glob}}'
 
 # ---- state -----------------------------------------------------------------
 
@@ -51,11 +57,19 @@ invalidate glob spec=spec:
 
 # ---- utilities -------------------------------------------------------------
 
-# Tail the SLURM/local output logs for nodes whose file matches GLOB.
-logs glob="*":
-    @tail -n +1 {{workdir}}/local-logs/{{glob}}* 2>/dev/null || \
-     tail -n +1 /u/ianchen3/scratch/slurm/{{glob}}* 2>/dev/null || \
-     echo "no logs match {{glob}}"
+# Tail the SLURM (remote) and local output logs for nodes matching GLOB.
+# Remote logs are named slurm-<jobid>.out (arrays: slurm-<jobid>_<idx>.out), so
+# we map GLOB -> job-id patterns via `log-ids` and tail them over ssh.
+logs glob='*' spec=spec:
+    @patterns="$(python3 pipeline.py log-ids {{spec}} '{{glob}}' | tr '\n' ' ')"; \
+     found=0; \
+     if [ -n "${patterns// /}" ]; then \
+       ssh cc "cd {{slurmlog}} && tail -n +1 $patterns" && found=1 || true; \
+     fi; \
+     if compgen -G "{{workdir}}/local-logs/{{glob}}*" >/dev/null; then \
+       tail -n +1 {{workdir}}/local-logs/{{glob}}*; found=1; \
+     fi; \
+     [ "$found" = 1 ] || echo "no logs match {{glob}}"
 
 # scancel every still-live (non-terminal) job recorded in the run log.
 cancel spec=spec:

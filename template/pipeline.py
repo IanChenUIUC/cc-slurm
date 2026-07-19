@@ -26,6 +26,8 @@ from collections import defaultdict
 
 RESERVED = {"params", "deps", "command", "array", "slurm"}
 SLURM_FLAGS = {"cpus": "-c", "mem": "-m", "partition": "-p", "time": "-t"}
+# Valueless slurm keys: truthy in the recipe -> the flag is emitted with no value.
+SLURM_BOOL_FLAGS = {"exclusive": "-x"}
 # Job states. Only COMPLETED is success; everything else terminal is a failure
 # (and thus resubmit-eligible). NON_TERMINAL states are still live: skip them.
 RUNNINGISH = {"RUNNING", "PENDING", "REQUEUED", "SUSPENDED",
@@ -233,10 +235,11 @@ class Engine:
     def _resolve_slurm_command(self):
         for n in self.order:
             merged = {**self.default_slurm, **n.rdef.get("slurm", {}), **n.slurm_override}
+            allowed = set(SLURM_FLAGS) | set(SLURM_BOOL_FLAGS)
             for k in merged:
-                if k not in SLURM_FLAGS:
+                if k not in allowed:
                     raise PipelineError(f"{n.ident}: unknown slurm key {k!r} "
-                                        f"(allowed: {sorted(SLURM_FLAGS)})")
+                                        f"(allowed: {sorted(allowed)})")
             n.slurm = {k: self._subst(str(v), n, n.aliases) for k, v in merged.items()}
             if "command" in n.rdef:
                 n.command = self._subst(n.rdef["command"], n, n.aliases)
@@ -401,6 +404,9 @@ class Engine:
         flags = " ".join(f"{SLURM_FLAGS[k]} {shlex.quote(str(n.slurm[k]))}"
                          for k in ["cpus", "mem", "partition", "time"]
                          for n in [u.nodes[0]] if k in n.slurm)
+        for k, flag in SLURM_BOOL_FLAGS.items():
+            if str(u.nodes[0].slurm.get(k, "")).lower() in ("true", "1", "yes"):
+                flags = f"{flags} {flag}".strip()
         deps = deps.strip()
         if u.kind == "individual":
             return f"cc-submit sbatch {script} -j {u.name} {flags} {deps}".rstrip()
@@ -575,6 +581,26 @@ class Engine:
             if rec.get("state") in NON_TERMINAL and rec.get("job_id"):
                 print(rec["job_id"])
 
+    def log_ids(self, globs, workdir=".pipeline"):
+        """Print, one per line, the remote SLURM log filename pattern for each
+        submitted unit whose node identity matches a glob: `slurm-<id>.out` for an
+        individual job, `slurm-<id>_*.out` for an array (whose tasks land in
+        slurm-<arrayid>_<idx>.out). Used by `just logs` to tail remote logs."""
+        log_path = pathlib.Path(workdir) / "run.jsonl"
+        last = {}
+        if log_path.exists():
+            for ln in log_path.read_text().splitlines():
+                if ln.strip():
+                    r = json.loads(ln)
+                    last[r["unit"]] = r
+        for u in self.unit_order:
+            if not any(fnmatch.fnmatch(n.ident, g) for g in globs for n in u.nodes):
+                continue
+            jid = (last.get(u.name) or {}).get("job_id")
+            if not jid:
+                continue
+            print(f"slurm-{jid}_*.out" if u.kind == "array" else f"slurm-{jid}.out")
+
     def invalidate(self, globs, workdir=".pipeline"):
         """Append INVALIDATED records for matching nodes so the next `submit`
         reruns them (and their downstream). Persistent across sessions; cleared
@@ -699,9 +725,10 @@ class Unit:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["dag", "dry", "submit", "status", "invalidate", "cancel-ids"])
+    ap.add_argument("action", choices=["dag", "dry", "submit", "status", "invalidate",
+                                       "cancel-ids", "log-ids"])
     ap.add_argument("spec")
-    ap.add_argument("globs", nargs="*", help="node-identity globs (for invalidate)")
+    ap.add_argument("globs", nargs="*", help="node-identity globs (for invalidate / log-ids)")
     ap.add_argument("--cc-submit", default="cc-submit")
     ap.add_argument("--sacct", default="sacct")
     ap.add_argument("--rerun", action="append", default=[],
@@ -728,6 +755,8 @@ def main():
             eng.invalidate(args.globs)
         elif args.action == "cancel-ids":
             eng.cancel_ids()
+        elif args.action == "log-ids":
+            eng.log_ids(args.globs or ["*"])
         else:
             eng.submit(cc=args.cc_submit, sacct=args.sacct, rerun=args.rerun,
                        only=args.only, local=args.local)

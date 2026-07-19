@@ -31,6 +31,7 @@ while [ $# -gt 0 ]; do
     -m|--mem)           shift 2 ;;     # ignored
     -p|--partition)     shift 2 ;;     # ignored
     -t|--time)          shift 2 ;;     # ignored
+    -x|--exclusive)     shift ;;       # ignored (valueless flag)
     --) shift ;;
     -*) shift ;;                       # unknown flag: skip
     *)  pos+=("$1"); shift ;;

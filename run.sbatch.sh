@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --partition=secondary
 #SBATCH --mem=64GB
-#SBATCH --output=/u/ianchen3/scratch/slurm/slurm-%A.out
+#SBATCH --output=/scratch/ianchen3/slurm/slurm-%A.out
 
 set -euo pipefail
 

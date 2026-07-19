@@ -9,7 +9,7 @@ import time
 
 import click
 
-WORKING_DIRECTORY = "/u/ianchen3/scratch"
+WORKING_DIRECTORY = "/scratch/ianchen3/"
 SLURM_SCRIPTS = "/u/ianchen3/slurm_scripts"
 
 help = """
@@ -72,7 +72,9 @@ def _upload_dir(path):
     )
 
     click.echo(f"Uploading {dirname}/ to cluster...", err=True)
-    subprocess.run(["scp", "-r", str(path), f"cc:{remote_tmp_path}/{dirname}"], check=True)
+    subprocess.run(
+        ["scp", "-r", str(path), f"cc:{remote_tmp_path}/{dirname}"], check=True
+    )
     return tmp_dir, dirname
 
 
@@ -135,8 +137,17 @@ def srun(partition, cpus_per_task, mem, walltime, nodes, ntasks):
 @click.option("--partition", "-p")
 @click.option("--mem", "-m")
 @click.option("--time", "-t", "walltime")
+@click.option("--exclusive", "-x", is_flag=True)
 def sbatch(
-    script, script_args, job_name, depends_on, cpus_per_task, partition, mem, walltime
+    script,
+    script_args,
+    job_name,
+    depends_on,
+    cpus_per_task,
+    partition,
+    mem,
+    walltime,
+    exclusive,
 ):
     """Run an sbatch job by uploading a local script to the cluster."""
     tmp_dir, fname = _upload(script)
@@ -155,6 +166,8 @@ def sbatch(
         opts.append(f"--mem={shlex.quote(mem)}")
     if walltime:
         opts.append(f"--time={shlex.quote(walltime)}")
+    if exclusive:
+        opts.append("--exclusive")
     opts = " ".join(opts)
 
     args = " ".join(shlex.quote(a) for a in script_args)
@@ -171,6 +184,7 @@ def sbatch(
 @click.option("--partition", "-p")
 @click.option("--mem", "-m")
 @click.option("--time", "-t", "walltime")
+@click.option("--exclusive", "-x", is_flag=True)
 def array(
     tasks_dir,
     job_name,
@@ -180,6 +194,7 @@ def array(
     partition,
     mem,
     walltime,
+    exclusive,
 ):
     """Submit an array job from a tasks directory of per-task scripts.
 
@@ -216,6 +231,8 @@ def array(
         opts.append(f"--mem={shlex.quote(mem)}")
     if walltime:
         opts.append(f"--time={shlex.quote(walltime)}")
+    if exclusive:
+        opts.append("--exclusive")
     opts = " ".join(opts)
 
     sbatch_cmd = f"sbatch {opts} {SLURM_SCRIPTS}/array.sbatch.sh {tmp_dir}/{dirname}"
