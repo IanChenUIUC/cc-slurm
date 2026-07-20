@@ -118,6 +118,14 @@ node depends on. `ref` is either a **recipe name appearing in `deps`**
 from each and **space-joined**. Referencing an alias of a non-dependency is an
 error.
 
+**Slurm flag — `${slurm.KEY}`** — reads this node's own resolved slurm flag
+(`${slurm.cpus}`, `${slurm.mem}`, …) after three-level merge (§7). `slurm` is a
+reserved `ref` (it shadows a parent recipe of that name). Usable in **`command`
+only** — slurm flags are resolved just before the command, so they are *not*
+available in aliases (resolved earlier) or in other slurm values (still being
+built). Referencing an unset flag is a hard error. Lets a command reuse its
+allocation, e.g. `OMP_NUM_THREADS=${slurm.cpus}`.
+
 **Lists.** In a string context (`command`, alias), a list resolves **space-joined**.
 In a list context (`deps`), a list **splices** (flattens) in place.
 

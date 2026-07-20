@@ -250,6 +250,8 @@ class Engine:
             content = m.group(1).strip()
             if "." in content:
                 ref, alias = (x.strip() for x in content.split(".", 1))
+                if ref == "slurm":
+                    return self._slurm_ref(node, alias)
                 return self._parent_alias(node, ref, alias)
             if content == "node":
                 return node.ident
@@ -262,6 +264,16 @@ class Engine:
                 raise NotReady(content)
             raise PipelineError(f"{node.ident}: undefined variable ${{{content}}}")
         return VAR.sub(repl, tmpl)
+
+    def _slurm_ref(self, node, key):
+        # ${slurm.KEY} reads the node's resolved slurm flag. Slurm is resolved
+        # just before the command (step 7), so this is usable in `command` only,
+        # not in aliases (resolved earlier) or in slurm values (still being built).
+        if key not in node.slurm:
+            raise PipelineError(
+                f"{node.ident}: ${{slurm.{key}}} refers to unset slurm flag {key!r} "
+                f"(resolved: {sorted(node.slurm)}); ${{slurm.*}} is usable in a recipe's command only")
+        return node.slurm[key]
 
     def _parent_alias(self, node, ref, alias):
         # ref is a parent recipe name, or a binding var holding capture strings
