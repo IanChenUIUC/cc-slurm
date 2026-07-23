@@ -52,16 +52,15 @@ case "$CMD" in
       rc=$?; echo "[cc-local] FAILED (exit $rc): $out" >&2; exit $rc; }
     ;;
   array)
-    cmdfile="${pos[0]}"
-    echo "[cc-local] array ${name:-$cmdfile}" >&2
-    i=0; rc_all=0
-    while IFS= read -r line || [ -n "$line" ]; do
-      [ -z "$line" ] && continue
+    tdir="${pos[0]}"
+    echo "[cc-local] array ${name:-$tdir}" >&2
+    rc_all=0
+    for script in $(ls "$tdir"/task-*.sh | sort -V); do
+      i=$(basename "$script" .sh); i=${i#task-}
       out="$LOGDIR/${name:-array}.$id.$i.out"
-      bash -c "$line" > "$out" 2>&1 || {
+      bash "$script" > "$out" 2>&1 || {
         rc=$?; echo "[cc-local] array task $i FAILED (exit $rc): $out" >&2; rc_all=$rc; }
-      i=$((i+1))
-    done < "$cmdfile"
+    done
     [ "$rc_all" -eq 0 ] || exit "$rc_all"
     ;;
   *)
