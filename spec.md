@@ -23,12 +23,12 @@ Every key inside `[recipe.X]` falls into exactly one category:
 
 | Category       | Keys                              | Meaning                                             |
 |----------------|-----------------------------------|-----------------------------------------------------|
-| **Structural** | `params`, `deps`, `command`, `array` | interpreted by the engine to build/run the graph |
+| **Structural** | `params`, `deps`, `command`, `array`, `array_axes` | interpreted by the engine to build/run the graph |
 | **SLURM**      | the `[recipe.X.slurm]` block      | become `cc-submit` flags                            |
 | **Alias**      | any other bare key (`output`)     | user-defined derived strings, readable across edges |
 
-**Reserved words:** `params`, `deps`, `command`, `array`, `slurm`. These may not
-be used as alias names.
+**Reserved words:** `params`, `deps`, `command`, `array`, `array_axes`, `slurm`.
+These may not be used as alias names.
 
 ---
 
@@ -256,6 +256,33 @@ If `array = true` is set on an ineligible recipe, the engine errors and names th
 violation; it never silently falls back to individual jobs (their dependency
 semantics differ, and that choice is yours).
 
+### Splitting one recipe into multiple arrays (`array_axes`)
+
+A cluster caps a single array at `MaxArraySize` (often ~1001 tasks). A recipe whose
+param fan-out exceeds that must become **several** arrays. Set `array_axes` to the
+list of params that sweep *within* each array; every **other** scalar param becomes
+a **split key**, and the engine emits one array per distinct combination of the
+split keys:
+
+```toml
+[recipe.bench]
+array      = true
+array_axes = ["rep", "size", "batch"]   # these vary inside each array
+params     = { dataset = [...7...], rep = [...20...], size = [1,5,10,20], batch = [1,10,100] }
+# -> 7 arrays (one per dataset) of 20×4×3 = 240 tasks each
+```
+
+Each group is an independent SLURM array with its **own** job id and **re-based**
+`0..N-1` task indices; its unit name is `recipe:<splitvals>` (e.g. `bench:dataset_a`).
+A single `array_axes` string is allowed. Omitting `array_axes` (or listing *all*
+params) keeps the recipe a single array (the default). Eligibility (uniform
+resources + dependency structure) is enforced **per group**.
+
+**`max_array_size`.** `[defaults].max_array_size` (default **1000**) is the per-array
+task cap the engine enforces at build time: any array unit — grouped or not — with
+more tasks is a hard error naming the recipe/group and suggesting `array_axes`, so an
+oversized recipe fails fast instead of being rejected by `sbatch`.
+
 ### Dependency translation
 
 Each edge is rendered according to the kinds of its endpoints:
@@ -343,8 +370,14 @@ Array units reconcile atomically: an array is `COMPLETED` only if all its tasks
 are, else the whole array is resubmit-eligible. (Per-task array resubmission via
 sparse `--array=` indices is a possible future refinement.)
 
-**Subcommands:** `dag`, `dry`, `submit` (`--rerun <glob>`), `status`,
-`invalidate <glob>`.
+**Subcommands:** `dag`, `dry`, `submit` (`--rerun <glob>`), `status` (`-v`),
+`invalidate <glob>`, `complete <glob>`, `cancel-ids`, `log-ids <glob>`.
+
+**`status` roll-up.** Any recipe that expands to **more than one unit** — an
+`array_axes` split *or* an individual-job fan-out — prints as **one** summary line,
+`recipe  [N arrays|jobs]  n COMPLETED · n RUNNING · …`, so the listing stays compact.
+`status -v` expands it to one row per unit; a recipe with a single unit always prints
+that unit's row.
 
 ---
 
@@ -356,6 +389,8 @@ sparse `--array=` indices is a possible future refinement.)
 | `deps`            | recipe                        | binding only | list of parent captures `R(k=v, k=*)`            |
 | `command`         | recipe                        | yes          | shell to run per node                             |
 | `array`           | recipe                        | no (bool)    | opt into single-array submission (§9)            |
+| `array_axes`      | recipe                        | no (list)    | params that sweep within each array; others split it into multiple arrays (§9) |
+| `max_array_size`  | defaults                      | no (int)     | per-array task cap, default 1000; build-time guard (§9) |
 | `slurm.*`         | defaults / recipe / record    | yes          | `cc-submit` flags (`cpus`,`mem`,`partition`,`time`) |
 | *(other key)*     | defaults / recipe             | yes          | alias — readable as `${recipe.key}`              |
 

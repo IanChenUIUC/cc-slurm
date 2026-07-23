@@ -48,8 +48,9 @@ force glob spec=spec:
 # ---- state -----------------------------------------------------------------
 
 # Reconcile against sacct and print each node's state, elapsed, and peak RSS.
-status spec=spec:
-    python3 pipeline.py status {{spec}} --sacct '{{sacct}}'
+# Grouped array recipes roll up to one summary line; pass verbose=1 to expand them.
+status spec=spec verbose='':
+    python3 pipeline.py status {{spec}} --sacct '{{sacct}}' {{ if verbose == '' { '' } else { '-v' } }}
 
 # Persistently mark nodes matching GLOB stale; next `run` reruns them + downstream.
 invalidate glob spec=spec:

@@ -24,7 +24,7 @@ import time
 import tomllib
 from collections import defaultdict
 
-RESERVED = {"params", "deps", "command", "array", "slurm"}
+RESERVED = {"params", "deps", "command", "array", "array_axes", "slurm"}
 SLURM_FLAGS = {"cpus": "-c", "mem": "-m", "partition": "-p", "time": "-t"}
 # Valueless slurm keys: truthy in the recipe -> the flag is emitted with no value.
 SLURM_BOOL_FLAGS = {"exclusive": "-x"}
@@ -71,7 +71,9 @@ class Engine:
         self.spec = spec
         self.defaults = spec.get("defaults", {})
         self.default_slurm = self.defaults.get("slurm", {})
-        self.default_aliases = {k: v for k, v in self.defaults.items() if k != "slurm"}
+        self.default_aliases = {k: v for k, v in self.defaults.items()
+                                if k not in ("slurm", "max_array_size")}
+        self.max_array_size = int(self.defaults.get("max_array_size", 1000))
         self.recipes = spec.get("recipe", {})
         self.nodes = []
         self.by_recipe = {}
@@ -96,12 +98,6 @@ class Engine:
             if n.ident in seen:
                 raise PipelineError(f"duplicate node identity: {n.ident}")
             seen[n.ident] = n
-
-        # index arrays deterministically
-        for name in self.recipes:
-            if self._is_array(name):
-                for i, n in enumerate(sorted(self.by_recipe.get(name, []), key=self._sortkey)):
-                    n.array_index = i
 
         self._wire()                 # step 4
         self.order = self._toposort()  # step 5
@@ -291,21 +287,49 @@ class Engine:
             vals.append(p.aliases[alias])
         return " ".join(vals)
 
-    # ---- submission units: individual jobs, or one array per array-recipe ----
+    def _array_groups(self, name, rnodes):
+        """Yield (unit_name, nodes) for an array recipe. With `array_axes`, split
+        into one array per distinct combination of the scalar params NOT listed as
+        axes (the axes are what sweeps *within* each array); without it, the whole
+        recipe is a single array (today's behavior)."""
+        axes = self.recipes[name].get("array_axes")
+        if not axes:
+            yield name, rnodes
+            return
+        axes = [axes] if isinstance(axes, str) else list(axes)
+        params = {k for k, _ in scalar_items(rnodes[0].binding)}
+        bad = [a for a in axes if a not in params]
+        if bad:
+            raise PipelineError(
+                f"array recipe {name!r}: array_axes {bad} not among its params {sorted(params)}")
+        split_keys = [k for k in sorted(params) if k not in axes]
+        if not split_keys:                     # axes == all params -> one array
+            yield name, rnodes
+            return
+        groups = defaultdict(list)
+        for n in rnodes:
+            groups[tuple(str(n.binding[k]) for k in split_keys)].append(n)
+        for key in sorted(groups):
+            yield f"{name}:{'-'.join(key)}", groups[key]
+
+    # ---- submission units: individual jobs, or one-or-more arrays per array-recipe ----
     def _build_units(self):
         self.units = []
         self.node_unit = {}
-        self.array_unit = {}
+        self.array_units = defaultdict(list)   # recipe -> [Unit, ...]
         for name, rnodes in self.by_recipe.items():
             if self._is_array(name):
-                u = Unit("array", name, rnodes)
-                self.array_unit[name] = u
-                self.units.append(u)
-                for n in rnodes:
-                    self.node_unit[n] = u
+                for gname, gnodes in self._array_groups(name, rnodes):
+                    u = Unit("array", gname, gnodes, recipe=name)
+                    for i, n in enumerate(sorted(gnodes, key=self._sortkey)):
+                        n.array_index = i      # index within this array (re-based per group)
+                    self.array_units[name].append(u)
+                    self.units.append(u)
+                    for n in gnodes:
+                        self.node_unit[n] = u
             else:
                 for n in rnodes:
-                    u = Unit("individual", n.ident, [n])
+                    u = Unit("individual", n.ident, [n], recipe=name)
                     self.units.append(u)
                     self.node_unit[n] = u
         # unit-level topo order
@@ -337,24 +361,30 @@ class Engine:
 
     # ---- Sec.9 array eligibility ----
     def _check_arrays(self):
-        for name, u in self.array_unit.items():
-            res = {tuple(sorted(n.slurm.items())) for n in u.nodes}
-            if len(res) > 1:
-                raise PipelineError(
-                    f"array recipe {name!r} ineligible: non-uniform resources across cells")
-            sigs = set()
-            for n in u.nodes:
-                sig = {}
-                for R in {p.recipe for p in n.parents}:
-                    if self._is_array(R):
-                        sig[R] = ("array",)
-                    else:
-                        sig[R] = frozenset(p.ident for p in n.parents if p.recipe == R)
-                sigs.add(frozenset(sig.items()))
-            if len(sigs) > 1:
-                raise PipelineError(
-                    f"array recipe {name!r} ineligible: non-uniform dependency "
-                    f"structure (nodes have distinct individual parents)")
+        for name, units in self.array_units.items():
+            for u in units:
+                if len(u.nodes) > self.max_array_size:
+                    raise PipelineError(
+                        f"array unit {u.name!r} has {len(u.nodes)} tasks > max_array_size "
+                        f"{self.max_array_size}; split it into smaller arrays with "
+                        f"array_axes (name fewer inner axes so more params become split keys)")
+                res = {tuple(sorted(n.slurm.items())) for n in u.nodes}
+                if len(res) > 1:
+                    raise PipelineError(
+                        f"array recipe {name!r} ineligible: non-uniform resources across cells")
+                sigs = set()
+                for n in u.nodes:
+                    sig = {}
+                    for R in {p.recipe for p in n.parents}:
+                        if self._is_array(R):
+                            sig[R] = ("array",)
+                        else:
+                            sig[R] = frozenset(p.ident for p in n.parents if p.recipe == R)
+                    sigs.add(frozenset(sig.items()))
+                if len(sigs) > 1:
+                    raise PipelineError(
+                        f"array recipe {name!r} ineligible: non-uniform dependency "
+                        f"structure (nodes have distinct individual parents)")
 
     # ---- dependency translation for a unit ----
     def _aligned(self, child_u, parent_u):
@@ -398,10 +428,12 @@ class Engine:
             parent_recipes = sorted({p.recipe for n in u.nodes for p in n.parents})
             for R in parent_recipes:
                 if self._is_array(R):
-                    pu = self.array_unit[R]
-                    if not use(pu):
-                        continue
-                    (aftercorr if self._aligned(u, pu) else afterok).append(uid(pu))
+                    parent_units = {self.node_unit[p]
+                                    for n in u.nodes for p in n.parents if p.recipe == R}
+                    for pu in sorted(parent_units, key=lambda x: x.name):
+                        if not use(pu):
+                            continue
+                        (aftercorr if self._aligned(u, pu) else afterok).append(uid(pu))
                 else:
                     pids = sorted({uid(pu)
                                    for n in u.nodes for p in n.parents if p.recipe == R
@@ -568,16 +600,39 @@ class Engine:
                 return f"{b:.0f}{unit}"
             b /= 1024
 
-    def status(self, sacct, workdir=".pipeline"):
+    def status(self, sacct, workdir=".pipeline", verbose=False):
         state = self.reconcile(sacct, pathlib.Path(workdir) / "run.jsonl")
         print(f"{'unit':40} {'state':12} {'elapsed':10} maxrss")
-        for u in self.unit_order:
-            rec = state.get(u.name)
+
+        def row(name, rec):
             if rec:
-                print(f"{u.name:40} {rec.get('state','?'):12} "
+                print(f"{name:40} {rec.get('state','?'):12} "
                       f"{str(rec.get('elapsed','-')):10} {self._fmt_rss(rec.get('max_rss'))}")
             else:
-                print(f"{u.name:40} {'absent':12}")
+                print(f"{name:40} {'absent':12}")
+
+        # cluster units by originating recipe, preserving unit_order (position of
+        # each recipe's first unit); any recipe with >1 unit (array groups or an
+        # individual-job fan-out) rolls up to a single summary line unless --verbose.
+        groups, pos = [], {}
+        for u in self.unit_order:
+            key = u.recipe or u.name
+            if key not in pos:
+                pos[key] = len(groups)
+                groups.append((key, []))
+            groups[pos[key]][1].append(u)
+
+        for key, us in groups:
+            if verbose or len(us) == 1:
+                for u in us:
+                    row(u.name, state.get(u.name))
+            else:
+                counts = defaultdict(int)
+                for u in us:
+                    counts[(state.get(u.name) or {}).get("state", "absent")] += 1
+                summary = " · ".join(f"{counts[s]} {s}" for s in sorted(counts))
+                noun = "arrays" if us[0].kind == "array" else "jobs"
+                print(f"{key:40} [{len(us)} {noun}]  {summary}")
 
     def cancel_ids(self, workdir=".pipeline"):
         """Print the job ids of every still-live (non-terminal) unit in the log,
@@ -757,10 +812,11 @@ class Engine:
 
 
 class Unit:
-    def __init__(self, kind, name, nodes):
+    def __init__(self, kind, name, nodes, recipe=None):
         self.kind = kind
         self.name = name
         self.nodes = nodes
+        self.recipe = recipe
         self.job_id = None
 
 
@@ -780,6 +836,8 @@ def main():
                          "errors if a matched node's upstream isn't COMPLETED or in the run")
     ap.add_argument("--local", action="store_true",
                     help="synchronous runner: log terminal state from its exit; skip sacct")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="status: expand grouped array recipes to per-group rows")
     args = ap.parse_args()
     try:
         try:
@@ -792,7 +850,7 @@ def main():
         elif args.action == "dry":
             eng.dry()
         elif args.action == "status":
-            eng.status(sacct=args.sacct)
+            eng.status(sacct=args.sacct, verbose=args.verbose)
         elif args.action == "invalidate":
             eng.invalidate(args.globs)
         elif args.action == "complete":
