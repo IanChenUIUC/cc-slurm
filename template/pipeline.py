@@ -769,11 +769,12 @@ class Engine:
                         frontier.append(c)
         else:
             unmet = set()                             # --only: upstream must be ready
-            for u in torun:
+            for u in torun:                           # a live parent is depended on via afterok
                 for pu in self.uparents[u]:
-                    if (state.get(pu.name) or {}).get("state") != "COMPLETED" and pu not in torun:
-                        unmet.add(f"{u.name} needs {pu.name} "
-                                  f"({(state.get(pu.name) or {}).get('state', 'absent')})")
+                    pst = (state.get(pu.name) or {}).get("state")
+                    live_ok = (not local) and pst in NON_TERMINAL
+                    if pst != "COMPLETED" and pu not in torun and not live_ok:
+                        unmet.add(f"{u.name} needs {pu.name} ({pst or 'absent'})")
             if unmet:
                 raise PipelineError("--only: unsatisfied dependencies (run them first): "
                                     + "; ".join(sorted(unmet)))
@@ -833,7 +834,7 @@ def main():
                     help="glob of node identities to force-resubmit now (repeatable)")
     ap.add_argument("--only", action="append", default=[],
                     help="restrict the run to nodes matching this glob (repeatable); "
-                         "errors if a matched node's upstream isn't COMPLETED or in the run")
+                         "errors if a matched node's upstream isn't COMPLETED, live, or in the run")
     ap.add_argument("--local", action="store_true",
                     help="synchronous runner: log terminal state from its exit; skip sacct")
     ap.add_argument("-v", "--verbose", action="store_true",

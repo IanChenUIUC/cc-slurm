@@ -350,8 +350,9 @@ already exists and its old job id may have aged out of `slurmctld`, which would
 otherwise make SLURM reject the submission ("Job dependency problem").
 - **`--only <glob>`** restricts the run to matching nodes only — no downstream,
   no unrelated branches. It does **not** run their upstream; instead it requires
-  each matched node's parents to be already `COMPLETED` or themselves in the run,
-  and errors (running nothing) otherwise. `--rerun`/skip-completed still apply
+  each matched node's parents to be already `COMPLETED`, still live (a running
+  parent is depended on via `afterok`), or themselves in the run, and errors
+  (running nothing) otherwise. `--rerun`/skip-completed still apply
   within the scope, so `--only` composes with them.
 - **`--rerun <glob>`** (transient) force-resubmits nodes whose identity matches,
   in this invocation only.
