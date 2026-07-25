@@ -12,14 +12,11 @@ set -euo pipefail
 CONTAINER=/u/ianchen3/venv/python_bootstrap-sandbox
 CMDDIR="$1"
 
-# Each task is its own script (task-<idx>.sh), so a task's command runs intact
-# regardless of how many lines it spans.
+# Each task is its own script (task-<idx>.sh)
 SCRIPT="$CMDDIR/task-${SLURM_ARRAY_TASK_ID}.sh"
 if [ ! -f "$SCRIPT" ]; then
   echo "no task script for array index $SLURM_ARRAY_TASK_ID in $CMDDIR" >&2
   exit 1
 fi
 
-# Run this task's script inside the container, exactly like run.sbatch.sh does
-# for individual jobs.
-exec apptainer exec "$CONTAINER" bash "$SCRIPT"
+exec apptainer exec -B /scratch:/scratch -B /projects:/projects "$CONTAINER" bash "$SCRIPT"
