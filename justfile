@@ -1,73 +1,100 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# The spec and the two runners are variables so you can override per-invocation:
-#   just run spec=other.toml
-#   just local                       # uses cc-local instead of cc-submit
+# Every verb takes an optional GLOB matching node identities, e.g. `just run 'testing-*'`.
+#
+# Behaviour flags are `just` variable overrides, so they go BEFORE the verb:
+#
+#   just local=1   run 'testing-*'      # here, synchronously, via cc-local (no SLURM)
+#   just force=1   run 'testing-*'      # the inputs or the code changed: redo these
+#                                       #   AND everything downstream
+#   just force=1 only=1 run 'testing-*' # the job flaked: redo these alone and leave
+#                                       #   downstream results in place
+#   just verbose=1 status               # expand rolled-up multi-unit recipes
+#   just spec=other.toml dag            # any variable below can be overridden this way
+#
+# (`just` only accepts overrides ahead of the recipe name; anything after it is a
+# positional argument, so `just run 'g' local=1` would be read as the spec path.)
+
+local   := ""
+force   := ""
+only    := ""
+verbose := ""
+
 spec       := "pipeline.toml"
 cc_submit  := "./cc-submit"
 cc_local   := "bash ./cc-local"
 sacct      := "ssh cc sacct"
+scancel    := "ssh cc scancel"
 workdir    := ".pipeline"
 slurmlog   := "/scratch/ianchen3/slurm"
+
+# How the runner and the scope are selected, shared by `run` and `dry`.
+runner  := if local == "" { "--cc-submit '" + cc_submit + "' --sacct '" + sacct + "'" } \
+           else { "--cc-submit '" + cc_local + "' --local" }
 
 default:
     @just --list
 
-# ---- inspection (no cluster, no side effects) ------------------------------
+# ---- inspection: no cluster, no side effects -------------------------------
 
-# Print the resolved DAG: nodes, edges, and dependency types.
-dag spec=spec:
-    python3 pipeline.py dag {{spec}}
+# Reach for it after editing the spec, to see what it expanded into.
 
-# Print the cc-submit commands that WOULD run, and materialize the scripts
-# into .pipeline/scripts/ for inspection (placeholder ids; nothing submitted).
-dry spec=spec:
-    python3 pipeline.py dry {{spec}}
+# The resolved DAG: nodes, edges, and dependency types.
+dag glob='*':
+    python3 pipeline.py dag {{spec}} '{{glob}}'
+
+# Reach for it before any run you're unsure about: same reconcile and same
+# decisions as `run`, printed instead of issued. Also materializes the job
+# scripts into the state dir so you can read them.
+
+# Exactly what `run` would submit, and why.
+dry glob='*':
+    python3 pipeline.py submit {{spec}} --dry --workdir '{{workdir}}' {{runner}} \
+        {{ if force == '' { "--only '" + glob + "'" } \
+           else { if only == '' { "--rerun '" + glob + "'" } \
+                  else { "--only '" + glob + "' --rerun '" + glob + "'" } } }}
+
+# Multi-unit recipes roll up to one line; `just verbose=1 status` expands them.
+
+# Each unit's state, elapsed time, and peak RSS.
+status glob='*':
+    python3 pipeline.py status {{spec}} --workdir '{{workdir}}' --sacct '{{sacct}}' \
+        {{ if verbose == '' { '' } else { '-v' } }}
 
 # ---- running ---------------------------------------------------------------
 
-# Reconcile, then submit failed/absent nodes (+ downstream) to SLURM.
-# Optional GLOB restricts the run to matching nodes (their upstream must be done).
-run glob='*' spec=spec:
-    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_submit}}' --sacct '{{sacct}}' --only '{{glob}}'
+# See the flag notes at the top of this file for local / force / only.
 
-# Same, but run jobs locally in the container via cc-local (no SLURM).
-# Synchronous: jobs are logged COMPLETED/FAILED directly, sacct is not consulted.
-local glob='*' spec=spec:
-    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_local}}' --local --only '{{glob}}'
-
-# Force-resubmit nodes matching GLOB this run only (transient), then submit.
-rerun glob spec=spec:
-    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_submit}}' --sacct '{{sacct}}' --rerun '{{glob}}'
-
-# Force-resubmit nodes matching GLOB, WITHOUT re-propagating to downstream nodes
-# (upstream must already be COMPLETED). Like `rerun` but scoped to GLOB only.
-force glob spec=spec:
-    python3 pipeline.py submit {{spec}} --cc-submit '{{cc_submit}}' --sacct '{{sacct}}' --only '{{glob}}' --rerun '{{glob}}'
+# Submit whatever isn't already COMPLETED, plus anything downstream of it.
+run glob='*':
+    python3 pipeline.py submit {{spec}} --workdir '{{workdir}}' {{runner}} {{ if force == '' { "--only '" + glob + "'" } \
+           else { if only == '' { "--rerun '" + glob + "'" } \
+                  else { "--only '" + glob + "' --rerun '" + glob + "'" } } }}
 
 # ---- state -----------------------------------------------------------------
 
-# Reconcile against sacct and print each node's state, elapsed, and peak RSS.
-# Grouped array recipes roll up to one summary line; pass verbose=1 to expand them.
-status spec=spec verbose='':
-    python3 pipeline.py status {{spec}} --sacct '{{sacct}}' {{ if verbose == '' { '' } else { '-v' } }}
+# Reach for it when you know something is wrong but aren't ready to rerun now
+# (`just force=1 run` is the do-it-now version).
 
-# Persistently mark nodes matching GLOB stale; next `run` reruns them + downstream.
-invalidate glob spec=spec:
-    python3 pipeline.py invalidate {{spec}} '{{glob}}'
+# Mark units stale; the next `run` redoes them and their downstream.
+invalidate glob:
+    python3 pipeline.py invalidate {{spec}} '{{glob}}' --workdir '{{workdir}}'
 
-# Force nodes matching GLOB to COMPLETED (e.g. after a manual re-run); `run` then
-# skips them and won't re-propagate downstream. Undone by a later invalidate/rerun.
-complete glob spec=spec:
-    python3 pipeline.py complete {{spec}} '{{glob}}'
+# Reach for it when you re-ran the work by hand outside the pipeline and just
+# need the DAG to agree. Undone by a later `invalidate`.
+
+# Force units to COMPLETED.
+complete glob:
+    python3 pipeline.py complete {{spec}} '{{glob}}' --workdir '{{workdir}}'
 
 # ---- utilities -------------------------------------------------------------
 
-# Tail the SLURM (remote) and local output logs for nodes matching GLOB.
-# Remote logs are named slurm-<jobid>.out (arrays: slurm-<jobid>_<idx>.out), so
-# we map GLOB -> job-id patterns via `log-ids` and tail them over ssh.
-logs glob='*' spec=spec:
-    @patterns="$(python3 pipeline.py log-ids {{spec}} '{{glob}}' | tr '\n' ' ')"; \
+# Remote logs are slurm-<jobid>.out (arrays: slurm-<jobid>_<idx>.out), so GLOB is
+# mapped to job-id patterns via `log-ids` and tailed over ssh.
+
+# Tail the remote SLURM logs and any local-run logs for matching units.
+logs glob='*':
+    @patterns="$(python3 pipeline.py log-ids {{spec}} '{{glob}}' --workdir '{{workdir}}' | tr '\n' ' ')"; \
      found=0; \
      if [ -n "${patterns// /}" ]; then \
        ssh cc "cd {{slurmlog}} && tail -n +1 $patterns" && found=1 || true; \
@@ -77,6 +104,12 @@ logs glob='*' spec=spec:
      fi; \
      [ "$found" = 1 ] || echo "no logs match {{glob}}"
 
-# scancel every still-live (non-terminal) job recorded in the run log.
-cancel spec=spec:
-    @python3 pipeline.py cancel-ids {{spec}} | xargs -r scancel && echo "cancelled live jobs"
+# Matched against the run log, so it still reaches jobs whose recipe has since
+# been renamed or deleted.
+
+# scancel every still-live job matching GLOB.
+cancel glob='*':
+    @ids="$(python3 pipeline.py cancel-ids {{spec}} '{{glob}}' --workdir '{{workdir}}' | tr '\n' ' ')"; \
+     if [ -z "${ids// /}" ]; then echo "no live jobs match {{glob}}"; else \
+       {{scancel}} $ids && echo "cancelled: $ids"; \
+     fi

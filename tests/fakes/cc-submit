@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Fake `cc-submit` for the mock harness (tests/mockpipe.py).
+
+Stands in for the real cluster-side `cc-submit` (which does `ssh cc`). Instead of
+submitting, it records each invocation's argv as one JSON line to `$CC_CAPTURE`
+and prints a deterministic job id (the engine reads the last stdout token).
+
+Id source, in order:
+  - `$CC_IDMAP` (JSON: job-name -> id), keyed by the `-j <name>` in argv;
+  - else a counter persisted in `$CC_CAPTURE.counter`, based at 100000.
+
+Accepts every flag verbatim (`sbatch`/`array`, `-j -c -m -p -t -d -C ...`); it
+only needs `-j` to name the job.
+"""
+import json
+import os
+import pathlib
+import sys
+
+ID_BASE = 100000
+
+
+def job_name(argv):
+    for i, tok in enumerate(argv):
+        if tok == "-j" and i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def next_id(capture):
+    counter = pathlib.Path(capture + ".counter")
+    n = int(counter.read_text()) if counter.exists() else ID_BASE
+    counter.write_text(str(n + 1))
+    return n
+
+
+def main():
+    argv = sys.argv[1:]
+    capture = os.environ.get("CC_CAPTURE")
+    if capture:
+        with open(capture, "a") as f:
+            f.write(json.dumps(argv) + "\n")
+
+    name = job_name(argv)
+    idmap = os.environ.get("CC_IDMAP")
+    jid = None
+    if idmap and name:
+        jid = json.loads(pathlib.Path(idmap).read_text()).get(name)
+    if jid is None:
+        jid = next_id(capture) if capture else ID_BASE
+    print(jid)
+
+
+if __name__ == "__main__":
+    main()

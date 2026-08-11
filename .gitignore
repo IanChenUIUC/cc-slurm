@@ -2,3 +2,5 @@ out/
 .pipeline/
 
 __pycache__/
+.venv/
+.pytest_cache/

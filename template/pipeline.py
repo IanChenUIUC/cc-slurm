@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Pipeline engine: resolve a TOML spec (see SPEC.md) into a SLURM job DAG and
+"""Pipeline engine: resolve a TOML spec (see spec.md) into a SLURM job DAG and
 emit cc-submit calls.
 
-    pipeline.py dag    spec.toml     # print resolved nodes + edges + dep types
-    pipeline.py dry    spec.toml     # print exact cc-submit commands (placeholder ids)
-    pipeline.py submit spec.toml     # materialize scripts, submit, log job ids
+    pipeline.py dag        spec.toml           # resolved nodes + edges + dep types
+    pipeline.py submit     spec.toml           # materialize scripts, submit, log ids
+    pipeline.py submit     spec.toml --dry     # ...same decisions, print instead
+    pipeline.py status     spec.toml [-v]      # state / elapsed / peak RSS per unit
+    pipeline.py invalidate spec.toml <glob>    # mark stale: next submit reruns it
+    pipeline.py complete   spec.toml <glob>    # force to success (ran it by hand)
+    pipeline.py cancel-ids spec.toml [<glob>]  # live job ids, for scancel
+    pipeline.py log-ids    spec.toml [<glob>]  # remote log filename patterns
 
-The resolution pipeline (SPEC.md Sec.9): expand params -> nodes; wire deps by
+`submit` flags: --only <glob> (this scope alone, no downstream), --rerun <glob>
+(force, propagates), --local (synchronous runner), --dry, --workdir.
+
+The resolution pipeline (spec.md Sec.9): expand params -> nodes; wire deps by
 capture matching; toposort; resolve aliases (topo order); render command + slurm;
 group into submission units (individual jobs / arrays); translate dependencies
 (afterok / aftercorr) and submit.
@@ -15,6 +23,7 @@ import argparse
 import fnmatch
 import itertools
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -43,6 +52,17 @@ class PipelineError(Exception):
 
 class NotReady(Exception):
     """Raised mid-substitution when a sibling alias isn't resolved yet."""
+
+
+def is_true(v, what="slurm flag"):
+    """Truthiness for the valueless slurm flags. Strict on purpose: a value that is
+    neither true-ish nor false-ish is an error, so a typo can't silently mean 'off'."""
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no", ""):
+        return False
+    raise PipelineError(f"{what}: expected a boolean, got {v!r}")
 
 
 def scalar_items(binding):
@@ -237,6 +257,9 @@ class Engine:
                     raise PipelineError(f"{n.ident}: unknown slurm key {k!r} "
                                         f"(allowed: {sorted(allowed)})")
             n.slurm = {k: self._subst(str(v), n, n.aliases) for k, v in merged.items()}
+            for k in SLURM_BOOL_FLAGS:                # validate here: the node names the error
+                if k in n.slurm:
+                    is_true(n.slurm[k], f"{n.ident}: slurm.{k}")
             if "command" in n.rdef:
                 n.command = self._subst(n.rdef["command"], n, n.aliases)
 
@@ -445,11 +468,11 @@ class Engine:
         afterok, aftercorr = self._dep_tokens(u, uid, keep)
         deps = " ".join(f"-d {t}" for t in afterok)
         deps += ("" if not aftercorr else " " + " ".join(f"-C {t}" for t in aftercorr))
-        flags = " ".join(f"{SLURM_FLAGS[k]} {shlex.quote(str(n.slurm[k]))}"
-                         for k in ["cpus", "mem", "partition", "time"]
-                         for n in [u.nodes[0]] if k in n.slurm)
+        slurm = u.nodes[0].slurm
+        flags = " ".join(f"{flag} {shlex.quote(str(slurm[k]))}"
+                         for k, flag in SLURM_FLAGS.items() if k in slurm)
         for k, flag in SLURM_BOOL_FLAGS.items():
-            if str(u.nodes[0].slurm.get(k, "")).lower() in ("true", "1", "yes"):
+            if is_true(slurm.get(k, False)):
                 flags = f"{flags} {flag}".strip()
         deps = deps.strip()
         if u.kind == "individual":
@@ -457,8 +480,10 @@ class Engine:
         return f"cc-submit array {script} -j {u.name} {flags} {deps}".rstrip()
 
     # ---- subcommands ----
-    def dag(self):
-        for u in self.unit_order:
+    def dag(self, globs=("*",)):
+        # Dependency tokens still name parents outside the glob -- that is the edge
+        # you most want to see when inspecting a subset.
+        for u in self._matching_units(globs, self.unit_order):
             head = (f"[array {len(u.nodes)}]" if u.kind == "array" else "[job]")
             print(f"{head} {u.name}")
             if u.kind == "array":
@@ -469,13 +494,6 @@ class Engine:
                 print(f"    afterok:   {', '.join(afterok)}")
             if aftercorr:
                 print(f"    aftercorr: {', '.join(aftercorr)}")
-
-    def dry(self, workdir=".pipeline"):
-        wd = pathlib.Path(workdir)
-        for u in self.unit_order:
-            script = self._materialize(u, wd)          # write the real script/cmds file
-            print(self._cmd(u, lambda x: f"<{x.name}>", str(script)))
-        print(f"# scripts written to {wd / 'scripts'}/", file=sys.stderr)
 
     # ---- materialize + invoke cc-submit for one unit ----
     def _materialize(self, u, wd):
@@ -498,10 +516,14 @@ class Engine:
                 "#!/bin/bash\nset -euo pipefail\n" + (n.command or "") + "\n")
         return tdir
 
+    def _runner_argv(self, cc, u, wd, uid, keep=None):
+        """The exact argv the runner receives; `cc` replaces the leading 'cc-submit'."""
+        cmd = self._cmd(u, uid, str(self._materialize(u, wd)), keep)
+        return shlex.split(cc) + cmd.split()[1:]
+
     def _invoke_cc(self, cc, u, wd, keep=None):
-        cmd = self._cmd(u, lambda x: x.job_id, str(self._materialize(u, wd)), keep)
-        parts = shlex.split(cc) + cmd.split()[1:]      # replace leading 'cc-submit'
-        return subprocess.run(parts, capture_output=True, text=True)
+        return subprocess.run(self._runner_argv(cc, u, wd, lambda x: x.job_id, keep),
+                              capture_output=True, text=True)
 
     @staticmethod
     def _read_log(log_path):
@@ -634,18 +656,23 @@ class Engine:
                 noun = "arrays" if us[0].kind == "array" else "jobs"
                 print(f"{key:40} [{len(us)} {noun}]  {summary}")
 
-    def cancel_ids(self, workdir=".pipeline"):
-        """Print the job ids of every still-live (non-terminal) unit in the log,
-        one per line, for piping to scancel."""
-        log_path = pathlib.Path(workdir) / "run.jsonl"
-        last = {}
-        if log_path.exists():
-            for ln in log_path.read_text().splitlines():
-                if ln.strip():
-                    r = json.loads(ln)
-                    last[r["unit"]] = r
-        for rec in last.values():
-            if rec.get("state") in NON_TERMINAL and rec.get("job_id"):
+    def _matching_units(self, globs, units=None):
+        return [u for u in (units if units is not None else self.units)
+                if any(fnmatch.fnmatch(n.ident, g) for g in globs for n in u.nodes)]
+
+    def cancel_ids(self, globs=("*",), workdir=".pipeline"):
+        """Print the job ids of every still-live (non-terminal) unit matching a glob,
+        one per line, for piping to scancel.
+
+        Matched against the *log*, not the spec, so a live job whose recipe was since
+        renamed or deleted is still cancellable -- which is the point of `cancel`."""
+        last = self._read_log(pathlib.Path(workdir) / "run.jsonl")
+        for name, rec in last.items():
+            if rec.get("state") not in NON_TERMINAL or not rec.get("job_id"):
+                continue
+            # A reconcile record carries no node list, so fall back to the unit name.
+            idents = [name] + (rec.get("nodes") or [])
+            if any(fnmatch.fnmatch(i, g) for g in globs for i in idents):
                 print(rec["job_id"])
 
     def log_ids(self, globs, workdir=".pipeline"):
@@ -653,81 +680,54 @@ class Engine:
         submitted unit whose node identity matches a glob: `slurm-<id>.out` for an
         individual job, `slurm-<id>_*.out` for an array (whose tasks land in
         slurm-<arrayid>_<idx>.out). Used by `just logs` to tail remote logs."""
-        log_path = pathlib.Path(workdir) / "run.jsonl"
-        last = {}
-        if log_path.exists():
-            for ln in log_path.read_text().splitlines():
-                if ln.strip():
-                    r = json.loads(ln)
-                    last[r["unit"]] = r
-        for u in self.unit_order:
-            if not any(fnmatch.fnmatch(n.ident, g) for g in globs for n in u.nodes):
-                continue
+        last = self._read_log(pathlib.Path(workdir) / "run.jsonl")
+        for u in self._matching_units(globs, self.unit_order):
             jid = (last.get(u.name) or {}).get("job_id")
             if not jid:
                 continue
             print(f"slurm-{jid}_*.out" if u.kind == "array" else f"slurm-{jid}.out")
 
-    def invalidate(self, globs, workdir=".pipeline"):
-        """Append INVALIDATED records for matching nodes so the next `submit`
-        reruns them (and their downstream). Persistent across sessions; cleared
-        naturally once a node re-runs to COMPLETED. INVALIDATED is deliberately
-        outside NON_TERMINAL, so reconcile won't query sacct for it and submit
-        won't treat it as live."""
+    def _force_state(self, globs, state, verb, workdir):
+        """Append a `state` record for every unit matching a glob, carrying the prior
+        job_id so `logs`/`cancel` still resolve."""
         wd = pathlib.Path(workdir)
         wd.mkdir(parents=True, exist_ok=True)
         log_path = wd / "run.jsonl"
-        last = {}
-        if log_path.exists():
-            for ln in log_path.read_text().splitlines():
-                if ln.strip():
-                    r = json.loads(ln)
-                    last[r["unit"]] = r
-        matched = [u for u in self.units
-                   if any(fnmatch.fnmatch(n.ident, g) for g in globs for n in u.nodes)]
+        last = self._read_log(log_path)
+        matched = self._matching_units(globs)
         if not matched:
-            print("invalidate: no nodes matched", file=sys.stderr)
+            print(f"{verb}: no nodes matched", file=sys.stderr)
             return
         with open(log_path, "a") as f:
             for u in matched:
                 f.write(json.dumps({"unit": u.name, "kind": u.kind,
                                     "job_id": (last.get(u.name) or {}).get("job_id"),
-                                    "state": "INVALIDATED",
+                                    "state": state,
                                     "nodes": [n.ident for n in u.nodes],
                                     "time": time.time()}) + "\n")
-                print(f"invalidated {u.name}")
+                print(f"{verb} {u.name}")
+
+    def invalidate(self, globs, workdir=".pipeline"):
+        """Mark matching nodes stale so the next `submit` reruns them (and their
+        downstream). Persistent across sessions; cleared naturally once a node
+        re-runs to COMPLETED. INVALIDATED is deliberately outside NON_TERMINAL, so
+        reconcile won't query sacct for it and submit won't treat it as live."""
+        self._force_state(globs, "INVALIDATED", "invalidated", workdir)
 
     def complete(self, globs, workdir=".pipeline"):
-        """Append COMPLETED records for matching nodes, forcing them to success
-        (e.g. after manually re-running a failed job). COMPLETED is terminal, so
-        reconcile won't re-query sacct and submit will skip the node and won't
-        re-propagate downstream. The prior job_id is carried so `logs`/`cancel`
-        still resolve; a later `invalidate`/`rerun` overrides this normally."""
-        wd = pathlib.Path(workdir)
-        wd.mkdir(parents=True, exist_ok=True)
-        log_path = wd / "run.jsonl"
-        last = {}
-        if log_path.exists():
-            for ln in log_path.read_text().splitlines():
-                if ln.strip():
-                    r = json.loads(ln)
-                    last[r["unit"]] = r
-        matched = [u for u in self.units
-                   if any(fnmatch.fnmatch(n.ident, g) for g in globs for n in u.nodes)]
-        if not matched:
-            print("complete: no nodes matched", file=sys.stderr)
-            return
-        with open(log_path, "a") as f:
-            for u in matched:
-                f.write(json.dumps({"unit": u.name, "kind": u.kind,
-                                    "job_id": (last.get(u.name) or {}).get("job_id"),
-                                    "state": "COMPLETED",
-                                    "nodes": [n.ident for n in u.nodes],
-                                    "time": time.time()}) + "\n")
-                print(f"completed {u.name}")
+        """Force matching nodes to success (e.g. after manually re-running a failed
+        job). COMPLETED is terminal, so reconcile won't re-query sacct and submit
+        will skip the node and won't re-propagate downstream. A later
+        `invalidate`/`--rerun` overrides this normally."""
+        self._force_state(globs, "COMPLETED", "completed", workdir)
 
     # ---- submit: reconcile, then run only failed/absent (+ --rerun, downstream) ----
-    def submit(self, cc, sacct="sacct", workdir=".pipeline", rerun=(), only=(), local=False):
+    def submit(self, cc, sacct="sacct", workdir=".pipeline", rerun=(), only=(),
+               local=False, dry=False):
+        """Reconcile, decide what to run, and submit it. With `dry`, take the same
+        path but print the runner argv instead of invoking it, and log no submission
+        (reconcile still records what sacct reported -- that is observed truth, and
+        `status` records it the same way)."""
         wd = pathlib.Path(workdir)
         wd.mkdir(parents=True, exist_ok=True)
         log_path = wd / "run.jsonl"
@@ -741,15 +741,13 @@ class Engine:
 
         scoped = bool(only) and set(only) != {"*"}
         if scoped:
-            scope = {u for u in self.units
-                     if any(fnmatch.fnmatch(n.ident, g) for g in only for n in u.nodes)}
+            scope = set(self._matching_units(only))
             if not scope:
                 raise PipelineError(f"--only matched no nodes: {list(only)}")
         else:
             scope = set(self.units)
 
-        forced = {u for u in scope
-                  if any(fnmatch.fnmatch(n.ident, g) for g in rerun for n in u.nodes)}
+        forced = set(self._matching_units(rerun, scope))
         torun = {u for u in scope
                  if u in forced or needs_run((state.get(u.name) or {}).get("state"))}
 
@@ -796,20 +794,35 @@ class Engine:
             return json.dumps({"unit": u.name, "kind": u.kind, "job_id": jid, "state": st,
                                "nodes": [n.ident for n in u.nodes], "time": time.time()}) + "\n"
 
-        with open(log_path, "a") as log:
+        # An in-wave parent has no id yet, while a live or skipped one keeps its logged
+        # id, so a dry run's dependency tokens are legitimately a mix of real and
+        # <placeholder>.
+        dry_uid = lambda x: x.job_id or f"<{x.name}>"          # noqa: E731
+        # Nothing is submitted in a dry run, so submission records go nowhere.
+        log = open(os.devnull if dry else log_path, "a")
+        try:
             for u in self.unit_order:
-                if u in torun:
-                    proc = self._invoke_cc(cc, u, wd, keep)
-                    jid = proc.stdout.strip().split()[-1] if proc.stdout.strip() else None
-                    if proc.returncode != 0:
-                        if local:                     # record the failure before aborting
-                            log.write(record(u, jid, "FAILED"))
-                        raise PipelineError(f"submit failed for {u.name}:\n{proc.stderr}")
-                    u.job_id = jid
-                    log.write(record(u, jid, "COMPLETED" if local else "SUBMITTED"))
-                    print(f"{'done  ' if local else 'submit'} {jid}\t{u.name}")
-                elif u in scope:
-                    print(f"skip   {u.name}\t({(state.get(u.name) or {}).get('state','absent')})")
+                if u not in torun:
+                    if u in scope:
+                        st = (state.get(u.name) or {}).get("state", "absent")
+                        print(f"skip   {u.name}\t({st})")
+                    continue
+                if dry:
+                    print(" ".join(self._runner_argv(cc, u, wd, dry_uid, keep)))
+                    continue
+                proc = self._invoke_cc(cc, u, wd, keep)
+                jid = proc.stdout.strip().split()[-1] if proc.stdout.strip() else None
+                if proc.returncode != 0:
+                    if local:                         # record the failure before aborting
+                        log.write(record(u, jid, "FAILED"))
+                    raise PipelineError(f"submit failed for {u.name}:\n{proc.stderr}")
+                u.job_id = jid
+                log.write(record(u, jid, "COMPLETED" if local else "SUBMITTED"))
+                print(f"{'done  ' if local else 'submit'} {jid}\t{u.name}")
+        finally:
+            log.close()
+        if dry:
+            print(f"# scripts written to {wd / 'scripts'}/", file=sys.stderr)
 
 
 class Unit:
@@ -823,7 +836,7 @@ class Unit:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["dag", "dry", "submit", "status", "invalidate",
+    ap.add_argument("action", choices=["dag", "submit", "status", "invalidate",
                                        "complete", "cancel-ids", "log-ids"])
     ap.add_argument("spec")
     ap.add_argument("globs", nargs="*",
@@ -837,6 +850,10 @@ def main():
                          "errors if a matched node's upstream isn't COMPLETED, live, or in the run")
     ap.add_argument("--local", action="store_true",
                     help="synchronous runner: log terminal state from its exit; skip sacct")
+    ap.add_argument("--dry", action="store_true",
+                    help="submit: decide identically, but print the runner argv and log nothing")
+    ap.add_argument("--workdir", default=".pipeline",
+                    help="state directory: run.jsonl + materialized scripts")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="status: expand grouped array recipes to per-group rows")
     args = ap.parse_args()
@@ -846,30 +863,29 @@ def main():
         except tomllib.TOMLDecodeError as e:
             raise PipelineError(f"invalid TOML in {args.spec}: {e}")
         eng = Engine(spec)
+        wd = args.workdir
         if args.action == "dag":
-            eng.dag()
-        elif args.action == "dry":
-            eng.dry()
+            eng.dag(args.globs or ["*"])
         elif args.action == "status":
-            eng.status(sacct=args.sacct, verbose=args.verbose)
+            eng.status(sacct=args.sacct, workdir=wd, verbose=args.verbose)
         elif args.action == "invalidate":
-            eng.invalidate(args.globs)
+            eng.invalidate(args.globs, workdir=wd)
         elif args.action == "complete":
-            eng.complete(args.globs)
+            eng.complete(args.globs, workdir=wd)
         elif args.action == "cancel-ids":
-            eng.cancel_ids()
+            eng.cancel_ids(args.globs or ["*"], workdir=wd)
         elif args.action == "log-ids":
-            eng.log_ids(args.globs or ["*"])
+            eng.log_ids(args.globs or ["*"], workdir=wd)
         else:
-            eng.submit(cc=args.cc_submit, sacct=args.sacct, rerun=args.rerun,
-                       only=args.only, local=args.local)
+            eng.submit(cc=args.cc_submit, sacct=args.sacct, workdir=wd, rerun=args.rerun,
+                       only=args.only, local=args.local, dry=args.dry)
     except PipelineError as e:
         sys.exit(f"pipeline: error: {e}")
     except BrokenPipeError:
-        try:
-            sys.stdout.close()
-        except Exception:
-            pass
+        # Downstream (`| head`) went away. Retarget stdout so the interpreter's
+        # shutdown flush can't re-raise on the dead pipe.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
 
 
 if __name__ == "__main__":

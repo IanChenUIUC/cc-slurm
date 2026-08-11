@@ -224,12 +224,13 @@ Submission is via `cc-submit`, whose interface is fixed:
 cc-submit sbatch <script> -j ${node} <flags> -d <id> -d <id> ...
 
 # array recipe (N tasks):
-cc-submit array <commands-file> -j <recipe> <flags> -d <id> ... [--aftercorr <id> ...]
+cc-submit array <commands-file> -j <recipe> <flags> -d <id> ... [-C <id> ...]
 ```
 
-`<flags>` renders the closed slurm set (§7) in deterministic order (`-c -m -p -t`);
-`-d`/`--aftercorr` render in deterministic node order. `cc-submit` prints the job
-id on stdout, which the engine captures.
+`<flags>` renders the closed slurm set (§7) in deterministic order (`-c -m -p -t`),
+followed by any valueless flags (`-x`); `-d` (`afterok`) and `-C` (`aftercorr`)
+render in deterministic node order. `cc-submit` prints the job id on stdout, which
+the engine captures.
 
 ---
 
@@ -285,7 +286,9 @@ oversized recipe fails fast instead of being rejected by `sbatch`.
 
 ### Dependency translation
 
-Each edge is rendered according to the kinds of its endpoints:
+Each edge is rendered according to the kinds of its endpoints. The names below are
+the SLURM dependency semantics; on the `cc-submit` command line they render as `-d`
+(`afterok`) and `-C` (`aftercorr`) — see §8.
 
 | child ← parent            | rendered dependency                    |
 |---------------------------|----------------------------------------|
@@ -371,8 +374,45 @@ Array units reconcile atomically: an array is `COMPLETED` only if all its tasks
 are, else the whole array is resubmit-eligible. (Per-task array resubmission via
 sparse `--array=` indices is a possible future refinement.)
 
-**Subcommands:** `dag`, `dry`, `submit` (`--rerun <glob>`), `status` (`-v`),
-`invalidate <glob>`, `complete <glob>`, `cancel-ids`, `log-ids <glob>`.
+- **`complete <glob>`** (persistent) appends a `COMPLETED` record for matching
+  nodes, forcing them to success — for work re-run by hand outside the pipeline.
+  Since `COMPLETED` is terminal, `submit` then skips the node *and* does not
+  re-propagate downstream. Overridden by a later `invalidate`/`--rerun`.
+- **`--dry`** takes the identical path — reconcile, scope, what-needs-running,
+  downstream propagation, the `keep`-filtered dependency edges — but prints the
+  runner argv instead of invoking it, and writes **no submission record**. It is
+  the same code as a real `submit`, so what it prints is what would run. Two
+  consequences worth knowing: reconcile still appends the states `sacct` reported
+  (that is observed truth, and `status` records it identically), and a parent that
+  is *in the same wave* has no job id yet, so its dependency renders as
+  `<unit-name>` while live and skipped parents show their real ids.
+
+**Subcommands:** `dag [<glob>]`, `submit` (`--only`/`--rerun <glob>`, `--local`,
+`--dry`), `status` (`-v`), `invalidate <glob>`, `complete <glob>`,
+`cancel-ids [<glob>]`, `log-ids [<glob>]`. All accept `--workdir` (default
+`.pipeline`). Every glob matches **node identities**; `cancel-ids` additionally
+matches unit names in the log, so a live job whose recipe was since renamed or
+deleted is still cancellable.
+
+### Which one do I reach for?
+
+The `justfile` shipped with the template maps these to seven verbs, each taking an
+optional glob, with the behaviour flags as `just` variable overrides (which must
+precede the recipe name):
+
+| you want to… | run |
+|---|---|
+| see what the spec expanded into | `just dag` |
+| see what a run would do, before doing it | `just dry 'testing-*'` |
+| run whatever still needs running | `just run` |
+| run one subset, upstream already done | `just run 'testing-*'` |
+| run it here, synchronously, no SLURM | `just local=1 run 'testing-*'` |
+| redo it: the inputs or the code changed | `just force=1 run 'testing-*'` |
+| redo it: the job flaked, downstream is fine | `just force=1 only=1 run 'testing-*'` |
+| mark it stale, but don't run it now | `just invalidate 'testing-*'` |
+| tell the DAG about work you did by hand | `just complete 'testing-*'` |
+| stop live jobs | `just cancel 'testing-*'` |
+| read the output | `just status`, `just logs 'testing-*'` |
 
 **`status` roll-up.** Any recipe that expands to **more than one unit** — an
 `array_axes` split *or* an individual-job fan-out — prints as **one** summary line,

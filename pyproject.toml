@@ -1,0 +1,14 @@
+[project]
+name = "cc-slurm-tests"
+version = "0"
+description = "Dev-only test harness for the cc-slurm pipeline engine (not shipped in the template)."
+requires-python = ">=3.11"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

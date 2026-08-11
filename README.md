@@ -12,11 +12,21 @@ A format for specifying these as a toml is described, and parsed.
 
 Using the `just` command runner is easy, and can understand the subcommands.
 
+Seven verbs, each taking an optional glob over node identities:
+
 - default: lists the commands
-- dry: prints out the commands that are run
-- dag: prints out the dependency structure
-- run: submits all jobs
-- status: shows the status of all jobs
+- dag: the dependency structure the spec expanded into
+- dry: exactly what `run` would submit, and why — same decisions, printed
+- run: submits whatever isn't COMPLETED, plus anything downstream
+- status: state, elapsed time, and peak RSS per unit
+- logs: tails the SLURM and local-run logs
+- invalidate / complete: mark units stale / force them to success
+- cancel: scancel matching live jobs
+
+Behaviour flags are `just` variable overrides, so they go **before** the verb:
+`just local=1 run 'g'` (synchronous, no SLURM), `just force=1 run 'g'` (redo it
+and its downstream), `just force=1 only=1 run 'g'` (redo it alone),
+`just verbose=1 status`. See `spec.md` §11 for which one to reach for.
 
 The `template.zip` contains the files that can be copied into any project.
 ```
@@ -45,7 +55,7 @@ On the user machine, the dependencies for running `cc-submit` and `pipeline.py` 
 On the login node, the `array.sbatch.sh` and `run.sbatch.sh` must be present in the `SLURM_DIRECTORY`, as specified in `cc-submit`.
 Finally, the compute node must have the `CONTAINER`, as specified in the `*.sbatch.sh` files above.
 
-For short testing runs on the login node, entering the `CONTIANER`, running `just local` with bypass the SLURM scheduler and run jobs directly.
+For short testing runs on the login node, entering the `CONTIANER`, running `just local=1 run` will bypass the SLURM scheduler and run jobs directly.
 Otherwise, figuring out what will be run using `just dry` and `just dag` commands, and then `just status`.
 
 ## How commands are materialized
@@ -62,3 +72,25 @@ Because every task is its own script, a `command` may span multiple lines (multi
 statements, heredocs, `\`-continuations) and runs intact — the same as an individual
 job. Accordingly, `cc-submit array` takes the **tasks directory** (not a one-line-per-command
 file) and sizes `--array` from the number of `task-*.sh` scripts in it.
+
+## Tests
+
+Dev-only; not shipped in the template (`gen-template.sh` copies just the four runners).
+
+```
+uv run pytest
+```
+
+The engine is exercised against a **mocked pipeline state** — no cluster. `tests/mockpipe.py`
+is dual-use: a library the tests import (`mock_run`) and a by-hand "is this fixed?" checker,
+e.g.
+
+```
+python3 tests/mockpipe.py --spec path/to/pipeline.toml \
+    --state genquery=RUNNING --state ib-core-decomp=COMPLETED \
+    --run "submit --only testing-csk*"
+```
+
+which seeds the run log + a fake `sacct`/`cc-submit` in a throwaway workdir and prints what
+the engine would submit (and the dependencies it would attach). See `tests/COVERAGE.md` for
+the spec-section → test ledger.
