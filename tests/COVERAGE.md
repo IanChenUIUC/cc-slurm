@@ -22,7 +22,10 @@ the template (`gen-template.sh` copies only the four runners).
 | spec § | Behavior | Status | Test |
 |--------|----------|--------|------|
 | §3  | `params` product / record / jagged; `${node}` identity; uniqueness | TODO | — |
+| §3  | `params` list references (bare + qualified); inclusive ranges; identities unaffected by int-vs-str | ✅ | `test_lists.py` |
 | §4  | interpolation: simple / `${parent.alias}` / `${slurm.KEY}` / list join-vs-splice | TODO | — |
+| §4  | a list alias interpolates space-joined, own and via `${parent.alias}` | ✅ | `test_lists.py` |
+| §8  | `command_file` interpolated + shebang from `interpreter`; verbatim body (no bash preamble); mode 0755; the artifact actually executes; bash default unchanged; `interpreter` alone is legal; array tasks each get both | ✅ | `test_command_file.py` |
 | §5  | aliases: topo-order resolution, alias cycle | TODO | — |
 | §6  | captures wire; dashed recipe names | partial | `test_deps.py::test_dashed_recipe_captures_parse_and_wire` |
 | §6  | explicit-fan-in rule, zero-match, `${listvar}` splice | TODO | — |
@@ -52,11 +55,22 @@ the template (`gen-template.sh` copies only the four runners).
 | reserved word used as alias | TODO | — |
 | unknown `slurm.*` key | TODO | — |
 | `array = true` on ineligible recipe | TODO | — |
+| `params` string naming no declared list / a non-list | ✅ | `test_lists.py` |
+| range with end below start | ✅ | `test_lists.py` |
+| both `command` and `command_file`; unreadable `command_file` | ✅ | `test_command_file.py` |
 
 ## Notes / spec drift
 
 - **`-C` vs `--aftercorr`** — resolved. `spec.md` §8 now documents `-C <id>` (and `-d`
   for `afterok`), matching what `_cmd` emits and what the tests assert.
+- **No escape for `${...}`.** Deliberate (spec.md §4), but it bites hardest in a
+  `command_file`: a placeholder-looking string in a *comment or docstring* is
+  interpolated too and fails as an undefined variable. Hit while writing
+  `examples/cmds/analyze.py`, which is why that file says so out loud.
+- **`${parent.alias}` joins across every matched parent**, so a `rep=*` fan-in reading
+  an alias its parents share repeats it once per parent (`reps 0 1 2 0 1 2 0 1 2`).
+  Pre-existing and unchanged — list aliases only made it visible. Untested; would need
+  a decision on whether de-duplication is wanted.
 - **`just` flag syntax.** Behaviour flags (`local`/`force`/`only`/`verbose`) are
   top-level `justfile` variables, so they must precede the recipe name
   (`just force=1 run 'g'`). `just` treats `name=value` *after* a recipe as a

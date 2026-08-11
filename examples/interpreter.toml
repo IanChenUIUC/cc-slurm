@@ -1,0 +1,51 @@
+# Bodies in another language: `command_file` + `interpreter`, plus declared lists
+# and ranges. Runnable end-to-end with no cluster:
+#
+#   just spec=examples/interpreter.toml local=1 run
+#
+# A materialized unit is an executable that declares its own interpreter, so a
+# Python recipe needs no shell wrapper -- see `.pipeline/scripts/` after a run.
+
+[defaults]
+output   = "out"
+datasets = ["cora", "citeseer"]
+
+[defaults.slurm]
+cpus = 2
+mem  = "4GB"
+
+# A plain bash recipe: no `interpreter`, so it keeps `set -euo pipefail`.
+[recipe.ingest]
+array   = true
+params  = { dataset = "datasets" }
+dir     = "${output}/${dataset}"
+raw     = "${dir}/raw.txt"
+command = """
+mkdir -p ${dir}
+seq 1 10 > ${raw}
+echo "ingested ${dataset}"
+"""
+
+# A Python body. Note `reps = "0..2"` is declared here and referenced by the
+# recipe below as `analyze.reps`, so the sweep is written once.
+[recipe.analyze]
+array        = true
+reps         = "0..2"
+deps         = ["ingest(dataset=${dataset})"]
+params       = { dataset = "datasets", rep = "analyze.reps" }
+dir          = "${output}/${dataset}"
+stats        = "${dir}/stats-rep${rep}.txt"
+interpreter  = "/usr/bin/env python3"
+command_file = "cmds/analyze.py"
+
+# `rep=*` is the explicit fan-in: one report per dataset, over all of that dataset's
+# reps. Note a `${parent.alias}` read joins across *every* matched parent, so a fan-in
+# reading an alias the parents share repeats it once per parent -- read per-parent
+# outputs (as here) rather than a shared list.
+[recipe.report]
+deps    = ["analyze(dataset=${dataset}, rep=*)"]
+params  = { dataset = "datasets" }
+command = """
+cat ${output}/${dataset}/stats-rep*.txt
+echo "report ${dataset}: $(ls ${output}/${dataset}/stats-rep*.txt | wc -l) reps"
+"""

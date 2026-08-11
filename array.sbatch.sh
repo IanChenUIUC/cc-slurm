@@ -12,11 +12,10 @@ set -euo pipefail
 CONTAINER=/u/ianchen3/venv/python_bootstrap-sandbox
 CMDDIR="$1"
 
-# Each task is its own script (task-<idx>.sh)
-SCRIPT="$CMDDIR/task-${SLURM_ARRAY_TASK_ID}.sh"
+SCRIPT="$CMDDIR/task-${SLURM_ARRAY_TASK_ID}"
 if [ ! -f "$SCRIPT" ]; then
   echo "no task script for array index $SLURM_ARRAY_TASK_ID in $CMDDIR" >&2
   exit 1
 fi
 
-exec apptainer exec -B /scratch:/scratch -B /projects:/projects "$CONTAINER" bash "$SCRIPT"
+exec apptainer exec -B /scratch:/scratch -B /projects:/projects "$CONTAINER" "$SCRIPT"

@@ -17,15 +17,15 @@ DATASETS = ["cora", "citeseer", "pubmed"]
 
 def test_multiline_array_command_materializes_one_script_per_task(mock_run):
     """A multi-line `command` in an `array = true` recipe becomes one intact
-    script per task (`task-<idx>.sh`), not one physical line per command line."""
+    script per task (`task-<idx>`), not one physical line per command line."""
     r = mock_run(MULTILINE, {}, "submit", "--dry")
     assert r.ok, r.stderr
 
     tasks_dir = r.workdir / ".pipeline" / "scripts" / "build.tasks"
     assert tasks_dir.is_dir()
-    scripts = sorted(tasks_dir.glob("task-*.sh"))
+    scripts = sorted(tasks_dir.glob("task-*"))
     # One task per node -- NOT one per physical command line (the original bug).
-    assert {s.name for s in scripts} == {f"task-{i}.sh" for i in range(len(DATASETS))}
+    assert {s.name for s in scripts} == {f"task-{i}" for i in range(len(DATASETS))}
 
     bodies = [s.read_text() for s in scripts]
     for ds in DATASETS:

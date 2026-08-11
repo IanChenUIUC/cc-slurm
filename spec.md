@@ -23,12 +23,12 @@ Every key inside `[recipe.X]` falls into exactly one category:
 
 | Category       | Keys                              | Meaning                                             |
 |----------------|-----------------------------------|-----------------------------------------------------|
-| **Structural** | `params`, `deps`, `command`, `array`, `array_axes` | interpreted by the engine to build/run the graph |
+| **Structural** | `params`, `deps`, `command`, `command_file`, `interpreter`, `array`, `array_axes` | interpreted by the engine to build/run the graph |
 | **SLURM**      | the `[recipe.X.slurm]` block      | become `cc-submit` flags                            |
 | **Alias**      | any other bare key (`output`)     | user-defined derived strings, readable across edges |
 
-**Reserved words:** `params`, `deps`, `command`, `array`, `array_axes`, `slurm`.
-These may not be used as alias names.
+**Reserved words:** `params`, `deps`, `command`, `command_file`, `interpreter`,
+`array`, `array_axes`, `slurm`. These may not be used as alias names.
 
 ---
 
@@ -79,10 +79,39 @@ sources = [
 ]
 ```
 
+**Referencing a declared list.** An axis value may be the *name* of a list declared
+elsewhere, so a sweep is written once and read by every recipe that shares it:
+
+```toml
+[defaults]
+testing = ["bitcoin", "friendster", "livejournal"]
+
+[recipe.genquery]
+reps   = "0..19"                 # a range: inclusive, ints
+sizes  = [1, 10]
+params = { dataset = "testing" }                        # bare -> [defaults]
+
+[recipe.search]
+params = { dataset = "testing", rep = "genquery.reps", size = "genquery.sizes" }
+```
+
+- **Bare** (`"testing"`) resolves in `[defaults]`; **qualified** (`"genquery.reps"`)
+  is a *static lookup of `recipe.key` in the TOML*. It is **not** a parent-alias read
+  (§4) — `params` fix node identity before `deps` are wired, so nothing here may
+  depend on the DAG or on run state.
+- Inside `params`, **a string always names a list; it is never a literal value.** A
+  one-value axis is written `[x]`. (Without this rule a bare string silently iterates
+  as *characters*.)
+- **Ranges** — `"a..b"`, inclusive, yielding ints. A range is just a way of writing a
+  list, so it means the same thing in `[defaults]`, on a recipe, and in `params`.
+  Identities render values with `str()`, so int-vs-string does not affect `${node}`.
+- Naming something undeclared, or something that is not a list, is a **hard error**.
+
 Rules:
 
 - **Literal.** No `${...}` interpolation inside `params`; it is the source of
-  bindings.
+  bindings. (A bare string names a declared list, as above — that is resolved
+  statically, not interpolated.)
 - **Binding variables.** Every key in a record (except the reserved `slurm`
   sub-key) is a binding variable: interpolable as `${key}`, matchable in
   captures. Values may be scalars or lists.
@@ -120,14 +149,23 @@ error.
 
 **Slurm flag — `${slurm.KEY}`** — reads this node's own resolved slurm flag
 (`${slurm.cpus}`, `${slurm.mem}`, …) after three-level merge (§7). `slurm` is a
-reserved `ref` (it shadows a parent recipe of that name). Usable in **`command`
-only** — slurm flags are resolved just before the command, so they are *not*
+reserved `ref` (it shadows a parent recipe of that name). Usable in **`command` /
+`command_file` only** — slurm flags are resolved just before the command, so they are *not*
 available in aliases (resolved earlier) or in other slurm values (still being
 built). Referencing an unset flag is a hard error. Lets a command reuse its
 allocation, e.g. `OMP_NUM_THREADS=${slurm.cpus}`.
 
 **Lists.** In a string context (`command`, alias), a list resolves **space-joined**.
-In a list context (`deps`), a list **splices** (flattens) in place.
+In a list context (`deps`), a list **splices** (flattens) in place. This holds for a
+list-valued *alias* as well as a list-valued binding, so a declared list survives
+into a body and can be recovered there — e.g. `"${sizes}".split()` in Python.
+
+**No escape syntax.** Every `${...}` in an interpolated value is substituted, and one
+that resolves to nothing is a hard error. There is deliberately no way to write a
+literal `${...}`, which matters most for a `command_file` (§8): a placeholder-looking
+string *anywhere* in the file — including in a comment or docstring — is interpolated
+too. Build such a string at runtime instead (`os.environ["HOME"]`, string
+concatenation).
 
 `${node}` is always available.
 
@@ -135,7 +173,8 @@ In a list context (`deps`), a list **splices** (flattens) in place.
 
 ## 5. Aliases
 
-Any bare key other than the reserved words. A per-node derived string (§4),
+Any bare key other than the reserved words. A per-node derived value (§4) —
+a string, or a **list** whose members are each interpolated —
 **readable by dependents** as `${thisrecipe.alias}`.
 
 ```toml
@@ -206,16 +245,41 @@ resolve with three-level precedence, per flag, highest wins:
 
 ## 8. `command` and submission
 
-`command` is the shell run per node, interpolated per node (§4). The engine
+`command` is the body run per node, interpolated per node (§4). The engine
 materializes it: individual nodes → an uploaded script run by `run.sbatch.sh`;
-array recipes → one script per task (`task-<idx>.sh`) in an uploaded tasks
+array recipes → one script per task (`task-<idx>`) in an uploaded tasks
 directory, task *i* run by `array.sbatch.sh` off `$SLURM_ARRAY_TASK_ID`. Because
 each task is its own script, a `command` may span multiple lines and runs intact
-— identical to the individual path. Both wrapper scripts invoke the command through `bash` inside
-the container, so `command` stays free-form shell (pipes, redirects, `&&`) and
-needs **no `bash -c` wrapping by the author**. The engine passes `command`
-through verbatim — it is never word-split; quoting *within* it is the author's
-responsibility.
+— identical to the individual path. The engine passes the body through verbatim
+— it is never word-split; quoting *within* it is the author's responsibility.
+
+**A materialized unit is a self-contained executable**, mode `0755`, whose first
+line is a shebang naming its own interpreter; the wrapper scripts exec it directly
+rather than assuming a language. Scripts therefore carry **no file extension** — the
+shebang is the single source of truth, so no suffix can contradict the contents.
+(`scp` must preserve the mode, hence `cc-submit`'s `-p`.)
+
+**`command_file` + `interpreter`.** For a body too long or too structured to sit in
+TOML, `command_file` names a file **relative to the spec's directory**, interpolated
+on exactly the same rules as `command`:
+
+```toml
+[recipe.analyze]
+interpreter  = "/usr/bin/env python3"
+command_file = "cmds/analyze.py"
+```
+
+- With no `interpreter`, the script is bash and keeps the `set -euo pipefail`
+  preamble; `command` stays free-form shell (pipes, redirects, `&&`) needing no
+  `bash -c` wrapping.
+- With an `interpreter`, the body is copied **verbatim** under `#!<interpreter>` and
+  nothing is injected — `set -euo pipefail` is bash-specific and would be meaningless.
+- `interpreter` does **not** require `command_file`; a short inline `command` may
+  declare one. Declaring both `command` and `command_file` is a hard error.
+- The body is read once per recipe and substituted per node, so an interpolated file
+  is a *template*, not a script to run by hand. Since substitution is textual and
+  unquoted, assign each `${...}` to a constant at the top of the file rather than
+  inlining it into an expression — and mind the no-escape rule (§4).
 
 Submission is via `cc-submit`, whose interface is fixed:
 
@@ -327,8 +391,13 @@ dependents can target specific elements (`<arrayid>_<idx>`).
 - A capture matching zero nodes.
 - Duplicate node identity.
 - A dependency cycle, or an alias cycle.
-- A reserved word (`params`/`deps`/`command`/`array`/`slurm`) used as an alias.
+- A reserved word (`params`/`deps`/`command`/`command_file`/`interpreter`/`array`/
+  `array_axes`/`slurm`) used as an alias.
 - An unknown `slurm.*` key.
+- A `params` string naming no declared list, or naming something that is not a list.
+- A range whose end is below its start.
+- A recipe declaring both `command` and `command_file`, or a `command_file` that
+  cannot be read.
 - `array = true` on an ineligible recipe (non-uniform resources or non-uniform
   dependency structure).
 
@@ -428,7 +497,9 @@ that unit's row.
 |-------------------|-------------------------------|--------------|--------------------------------------------------|
 | `params`          | recipe                        | no           | node set: product table or record list           |
 | `deps`            | recipe                        | binding only | list of parent captures `R(k=v, k=*)`            |
-| `command`         | recipe                        | yes          | shell to run per node                             |
+| `command`         | recipe                        | yes          | body to run per node                              |
+| `command_file`    | recipe                        | yes          | body read from a file, path relative to the spec dir (§8) |
+| `interpreter`     | recipe                        | yes          | shebang for the materialized script; default bash (§8) |
 | `array`           | recipe                        | no (bool)    | opt into single-array submission (§9)            |
 | `array_axes`      | recipe                        | no (list)    | params that sweep within each array; others split it into multiple arrays (§9) |
 | `max_array_size`  | defaults                      | no (int)     | per-array task cap, default 1000; build-time guard (§9) |
@@ -547,3 +618,26 @@ Individual jobs only. Setting `array = true` here is a hard error on **both**
 counts: per-cell `slurm` overrides differ across nodes (non-uniform resources),
 and each node has a distinct hand-picked `sources` parent set (non-uniform
 dependency structure). Each irregularity costs one line in the cell that owns it.
+
+### 13.4 Declared lists, ranges, and a body in another language
+
+`examples/interpreter.toml` + `examples/cmds/analyze.py`. A bash recipe and a Python
+one in the same DAG, with a range declared once and referenced by a consumer:
+
+```toml
+[defaults]
+datasets = ["cora", "citeseer"]
+
+[recipe.analyze]
+array        = true
+reps         = "0..2"
+deps         = ["ingest(dataset=${dataset})"]
+params       = { dataset = "datasets", rep = "analyze.reps" }
+stats        = "${output}/${dataset}/stats-rep${rep}.txt"
+interpreter  = "/usr/bin/env python3"
+command_file = "cmds/analyze.py"
+```
+
+Runnable with no cluster: `just spec=examples/interpreter.toml local=1 run`. Note
+`${parent.alias}` joins across *every* matched parent, so a `rep=*` fan-in reading an
+alias its parents share repeats it once per parent — read per-parent outputs instead.

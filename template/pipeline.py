@@ -14,6 +14,10 @@ emit cc-submit calls.
 `submit` flags: --only <glob> (this scope alone, no downstream), --rerun <glob>
 (force, propagates), --local (synchronous runner), --dry, --workdir.
 
+A recipe's body is `command`, or `command_file` (a file next to the spec, interpolated
+the same way). Each materialized unit is an executable declaring its own interpreter
+in a shebang, so the runners exec it directly rather than assuming bash.
+
 The resolution pipeline (spec.md Sec.9): expand params -> nodes; wire deps by
 capture matching; toposort; resolve aliases (topo order); render command + slurm;
 group into submission units (individual jobs / arrays); translate dependencies
@@ -32,8 +36,10 @@ import sys
 import time
 import tomllib
 from collections import defaultdict
+from typing import Any
 
-RESERVED = {"params", "deps", "command", "array", "array_axes", "slurm"}
+RESERVED = {"params", "deps", "command", "command_file", "interpreter",
+            "array", "array_axes", "slurm"}
 SLURM_FLAGS = {"cpus": "-c", "mem": "-m", "partition": "-p", "time": "-t"}
 # Valueless slurm keys: truthy in the recipe -> the flag is emitted with no value.
 SLURM_BOOL_FLAGS = {"exclusive": "-x"}
@@ -44,6 +50,7 @@ RUNNINGISH = {"RUNNING", "PENDING", "REQUEUED", "SUSPENDED",
 NON_TERMINAL = RUNNINGISH | {"SUBMITTED", "UNKNOWN"}
 VAR = re.compile(r"\$\{([^}]+)\}")
 CAP = re.compile(r"^([\w-]+)\s*\((.*)\)\s*$")   # recipe names are TOML bare keys (may contain '-')
+RANGE = re.compile(r"^(-?\d+)\.\.(-?\d+)$")
 
 
 class PipelineError(Exception):
@@ -65,6 +72,28 @@ def is_true(v, what="slurm flag"):
     raise PipelineError(f"{what}: expected a boolean, got {v!r}")
 
 
+def expand_ranges(v) -> Any:
+    """Rewrite "a..b" strings into inclusive int lists, everywhere in the spec.
+
+    Uniform on purpose: a range is simply a way of writing a list, so it means the
+    same thing in `[defaults]`, on a recipe, and inside `params`. The rule is not
+    "a range is a list only where a list is expected", which would make
+    `${reps}` mean different things in different positions.
+    """
+    if isinstance(v, dict):
+        return {k: expand_ranges(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [expand_ranges(x) for x in v]
+    if isinstance(v, str):
+        m = RANGE.fullmatch(v.strip())
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if hi < lo:
+                raise PipelineError(f"range {v!r}: end is below start")
+            return list(range(lo, hi + 1))
+    return v
+
+
 def scalar_items(binding):
     return [(k, v) for k, v in binding.items() if not isinstance(v, list)]
 
@@ -82,13 +111,16 @@ class Node:
         self.alias_defs = {}       # name -> template
         self.slurm = {}            # resolved flags
         self.command = None
+        self.interpreter = None    # None -> the script is bash (see _materialize)
         self.array_index = None
         self.job_id = None         # assigned at submit
 
 
 class Engine:
-    def __init__(self, spec):
+    def __init__(self, spec, specdir=pathlib.Path(".")):
+        spec = expand_ranges(spec)
         self.spec = spec
+        self.specdir = pathlib.Path(specdir)
         self.defaults = spec.get("defaults", {})
         self.default_slurm = self.defaults.get("slurm", {})
         self.default_aliases = {k: v for k, v in self.defaults.items()
@@ -97,13 +129,14 @@ class Engine:
         self.recipes = spec.get("recipe", {})
         self.nodes = []
         self.by_recipe = {}
+        self._body_cache = {}
         self._build()
 
     # ---- Sec.9 step 2-3: expand params into identified nodes ----
     def _build(self):
         for name, rdef in self.recipes.items():
             raw = rdef.get("params", None)
-            records = self._records(raw)
+            records = self._records(raw, name)
             recipe_aliases = {k: v for k, v in rdef.items() if k not in RESERVED}
             for rec in records:
                 rec = dict(rec)
@@ -130,16 +163,44 @@ class Engine:
     def _sortkey(n):
         return tuple(str(v) for _, v in scalar_items(n.binding))
 
-    def _records(self, raw):
+    def _records(self, raw, recipe):
         if raw is None:
             return [{}]
         if isinstance(raw, dict):        # product sugar
             keys = list(raw)
-            return [dict(zip(keys, combo))
-                    for combo in itertools.product(*(raw[k] for k in keys))]
+            axes = [self._axis(raw[k], recipe, k) for k in keys]
+            return [dict(zip(keys, combo)) for combo in itertools.product(*axes)]
         if isinstance(raw, list):        # explicit record list
             return raw
         raise PipelineError("params must be a table (product) or a list of records")
+
+    def _axis(self, v, recipe, key):
+        """One param axis: a list is literal, a string names a declared list.
+
+        Strings are never literal values here -- a one-value axis is written
+        `[x]`. Without that rule a string silently iterates as characters, which
+        is what `dataset = "all"` used to do."""
+        if isinstance(v, list):
+            return v
+        if not isinstance(v, str):
+            raise PipelineError(f"{recipe}.params.{key}: expected a list or the name "
+                                f"of a declared list, got {v!r}")
+        if "." in v:
+            rname, rkey = v.split(".", 1)
+            src = self.recipes.get(rname)
+            if src is None or rkey not in src:
+                raise PipelineError(f"{recipe}.params.{key}: {v!r} names no declared "
+                                    f"list (no recipe {rname!r} with key {rkey!r})")
+            found = src[rkey]
+        elif v in self.defaults:
+            found = self.defaults[v]
+        else:
+            raise PipelineError(f"{recipe}.params.{key}: {v!r} names no declared list "
+                                f"in [defaults] (declared: {sorted(self.defaults)})")
+        if not isinstance(found, list):
+            raise PipelineError(f"{recipe}.params.{key}: {v!r} resolves to "
+                                f"{found!r}, which is not a list")
+        return found
 
     def _is_array(self, recipe):
         return bool(self.recipes[recipe].get("array", False))
@@ -238,7 +299,8 @@ class Engine:
                 progressed = False
                 for name, tmpl in list(pending.items()):
                     try:
-                        n.aliases[name] = self._subst(tmpl, n, n.aliases, allow_pending=True)
+                        n.aliases[name] = self._subst_value(tmpl, n, n.aliases,
+                                                            allow_pending=True)
                     except NotReady:
                         continue
                     del pending[name]
@@ -260,10 +322,31 @@ class Engine:
             for k in SLURM_BOOL_FLAGS:                # validate here: the node names the error
                 if k in n.slurm:
                     is_true(n.slurm[k], f"{n.ident}: slurm.{k}")
-            if "command" in n.rdef:
-                n.command = self._subst(n.rdef["command"], n, n.aliases)
+            if "command" in n.rdef and "command_file" in n.rdef:
+                raise PipelineError(f"{n.recipe}: declares both command and command_file")
+            body = n.rdef.get("command")
+            if "command_file" in n.rdef:
+                body = self._command_file(n.rdef["command_file"], n.recipe)
+            if body is not None:
+                n.command = self._subst(body, n, n.aliases)
+            if "interpreter" in n.rdef:
+                n.interpreter = self._subst(n.rdef["interpreter"], n, n.aliases)
 
     # ---- the one interpolation routine (SPEC.md Sec.4) ----
+    @staticmethod
+    def _render(v):
+        """A value as it appears inside a command: a list joins on spaces, so a
+        driver can recover it with `"${somelist}".split()`."""
+        return " ".join(map(str, v)) if isinstance(v, list) else str(v)
+
+    def _subst_value(self, v, node, aliases, allow_pending=False):
+        """Substitute into a declared value, preserving list structure. A list
+        alias stays a list until something interpolates it, so its members are
+        each substituted and it can still be joined later."""
+        if isinstance(v, list):
+            return [self._subst_value(x, node, aliases, allow_pending) for x in v]
+        return self._subst(str(v), node, aliases, allow_pending)
+
     def _subst(self, tmpl, node, aliases, allow_pending=False):
         def repl(m):
             content = m.group(1).strip()
@@ -275,14 +358,24 @@ class Engine:
             if content == "node":
                 return node.ident
             if content in node.binding:
-                v = node.binding[content]
-                return " ".join(map(str, v)) if isinstance(v, list) else str(v)
+                return self._render(node.binding[content])
             if content in aliases:
-                return aliases[content]
+                return self._render(aliases[content])
             if allow_pending and content in node.alias_defs:
                 raise NotReady(content)
             raise PipelineError(f"{node.ident}: undefined variable ${{{content}}}")
         return VAR.sub(repl, tmpl)
+
+    def _command_file(self, rel, recipe):
+        """Read a recipe body from a file, resolved against the spec's directory so
+        a spec is relocatable. Cached: one read per recipe, not per node."""
+        if rel not in self._body_cache:
+            p = self.specdir / rel
+            try:
+                self._body_cache[rel] = p.read_text()
+            except OSError as e:
+                raise PipelineError(f"{recipe}: cannot read command_file {p}: {e}")
+        return self._body_cache[rel]
 
     def _slurm_ref(self, node, key):
         # ${slurm.KEY} reads the node's resolved slurm flag. Slurm is resolved
@@ -307,14 +400,14 @@ class Engine:
         for p in targets:
             if alias not in p.aliases:
                 raise PipelineError(f"{node.ident}: parent {p.ident} has no alias {alias!r}")
-            vals.append(p.aliases[alias])
+            vals.append(self._render(p.aliases[alias]))
         return " ".join(vals)
 
     def _array_groups(self, name, rnodes):
         """Yield (unit_name, nodes) for an array recipe. With `array_axes`, split
         into one array per distinct combination of the scalar params NOT listed as
         axes (the axes are what sweeps *within* each array); without it, the whole
-        recipe is a single array (today's behavior)."""
+        recipe is a single array."""
         axes = self.recipes[name].get("array_axes")
         if not axes:
             yield name, rnodes
@@ -496,24 +589,36 @@ class Engine:
                 print(f"    aftercorr: {', '.join(aftercorr)}")
 
     # ---- materialize + invoke cc-submit for one unit ----
+    @staticmethod
+    def _write_script(path, node):
+        """A materialized unit is a self-contained executable that declares its own
+        interpreter, so the runners can exec it directly rather than knowing which
+        language it is. `set -euo pipefail` is bash-specific and is therefore only
+        injected for the default bash case -- with an `interpreter`, the body is
+        copied verbatim and nothing is added but the shebang."""
+        if node.interpreter:
+            head = f"#!{node.interpreter}\n"
+        else:
+            head = "#!/bin/bash\nset -euo pipefail\n"
+        path.write_text(head + (node.command or "") + "\n")
+        path.chmod(0o755)
+        return path
+
     def _materialize(self, u, wd):
         sdir = wd / "scripts"
         sdir.mkdir(parents=True, exist_ok=True)
         if u.kind == "individual":
-            p = sdir / f"{u.name}.sh"
-            p.write_text("#!/bin/bash\nset -euo pipefail\n" + (u.nodes[0].command or "") + "\n")
-            return p
+            return self._write_script(sdir / u.name, u.nodes[0])
         # Array: one script per task, mirroring the individual path, so a task's
         # command runs intact no matter how many lines it spans. The filename is
         # keyed on array_index (the authoritative task<->node map from _build),
         # so SLURM task i always runs node i's full command.
         tdir = sdir / f"{u.name}.tasks"
         tdir.mkdir(parents=True, exist_ok=True)
-        for old in tdir.glob("task-*.sh"):     # clear stale scripts from a prior run
+        for old in tdir.glob("task-*"):        # clear stale scripts from a prior run
             old.unlink()
         for n in u.nodes:
-            (tdir / f"task-{n.array_index}.sh").write_text(
-                "#!/bin/bash\nset -euo pipefail\n" + (n.command or "") + "\n")
+            self._write_script(tdir / f"task-{n.array_index}", n)
         return tdir
 
     def _runner_argv(self, cc, u, wd, uid, keep=None):
@@ -862,7 +967,7 @@ def main():
             spec = tomllib.loads(pathlib.Path(args.spec).read_text())
         except tomllib.TOMLDecodeError as e:
             raise PipelineError(f"invalid TOML in {args.spec}: {e}")
-        eng = Engine(spec)
+        eng = Engine(spec, specdir=pathlib.Path(args.spec).parent)
         wd = args.workdir
         if args.action == "dag":
             eng.dag(args.globs or ["*"])

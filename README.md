@@ -62,11 +62,17 @@ Otherwise, figuring out what will be run using `just dry` and `just dag` command
 
 `just dry`/`just run` write the resolved, per-node `command` under `.pipeline/scripts/`:
 
-- **Individual jobs** → one script `<node>.sh`, uploaded and run by `run.sbatch.sh` (`bash <script>`).
+- **Individual jobs** → one script `<node>`, uploaded and run by `run.sbatch.sh`.
 - **Array recipes** (`array = true`) → a directory `<recipe>.tasks/` holding one
-  script per task, `task-<idx>.sh`, where `idx` is the node's array index. The
+  script per task, `task-<idx>`, where `idx` is the node's array index. The
   whole directory is uploaded and `array.sbatch.sh` runs task *i* via
-  `bash <dir>/task-$SLURM_ARRAY_TASK_ID.sh`.
+  `<dir>/task-$SLURM_ARRAY_TASK_ID`.
+
+Each script is a **self-contained executable** (mode 0755) whose first line is a
+shebang: `#!/bin/bash` plus `set -euo pipefail` by default, or `#!<interpreter>` when
+the recipe declares one — so a body can be written in Python (or anything else) via
+`command_file` + `interpreter`, and the wrapper scripts exec it without knowing the
+language. Hence no file extension: the shebang is the single source of truth.
 
 Because every task is its own script, a `command` may span multiple lines (multiple
 statements, heredocs, `\`-continuations) and runs intact — the same as an individual

@@ -12,4 +12,4 @@ set -euo pipefail
 CONTAINER=/u/ianchen3/venv/python_bootstrap-sandbox
 SCRIPT="$1"; shift
 
-exec apptainer exec -B /scratch:/scratch -B /projects:/projects "$CONTAINER" bash "$SCRIPT" "$@"
+exec apptainer exec -B /scratch:/scratch -B /projects:/projects "$CONTAINER" "$SCRIPT" "$@"

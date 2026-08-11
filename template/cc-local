@@ -48,17 +48,17 @@ case "$CMD" in
     args=("${pos[@]:1}")
     out="$LOGDIR/${name:-job}.$id.out"
     echo "[cc-local] ${name:-$script} -> $out" >&2
-    bash "$script" "${args[@]}" > "$out" 2>&1 || {
+    "$script" "${args[@]}" > "$out" 2>&1 || {
       rc=$?; echo "[cc-local] FAILED (exit $rc): $out" >&2; exit $rc; }
     ;;
   array)
     tdir="${pos[0]}"
     echo "[cc-local] array ${name:-$tdir}" >&2
     rc_all=0
-    for script in $(ls "$tdir"/task-*.sh | sort -V); do
-      i=$(basename "$script" .sh); i=${i#task-}
+    for script in $(ls "$tdir"/task-* | sort -V); do
+      i=$(basename "$script"); i=${i#task-}
       out="$LOGDIR/${name:-array}.$id.$i.out"
-      bash "$script" > "$out" 2>&1 || {
+      "$script" > "$out" 2>&1 || {
         rc=$?; echo "[cc-local] array task $i FAILED (exit $rc): $out" >&2; rc_all=$rc; }
     done
     [ "$rc_all" -eq 0 ] || exit "$rc_all"

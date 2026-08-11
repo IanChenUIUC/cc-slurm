@@ -55,7 +55,9 @@ def _upload(path):
     )
 
     click.echo(f"Uploading {fname} to cluster...", err=True)
-    subprocess.run(["scp", str(path), f"cc:{remote_tmp_path}/{fname}"], check=True)
+    # -p carries the mode across: job scripts are executables run directly by
+    # *.sbatch.sh, so losing the exec bit in transit would fail every job.
+    subprocess.run(["scp", "-p", str(path), f"cc:{remote_tmp_path}/{fname}"], check=True)
     return tmp_dir, fname
 
 
@@ -73,7 +75,7 @@ def _upload_dir(path):
 
     click.echo(f"Uploading {dirname}/ to cluster...", err=True)
     subprocess.run(
-        ["scp", "-r", str(path), f"cc:{remote_tmp_path}/{dirname}"], check=True
+        ["scp", "-rp", str(path), f"cc:{remote_tmp_path}/{dirname}"], check=True
     )
     return tmp_dir, dirname
 
@@ -209,9 +211,9 @@ def array(
         click.echo(f"No such directory: {tasks_dir}", err=True)
         sys.exit(1)
 
-    n_cmds = len(list(pathlib.Path(tasks_dir).glob("task-*.sh")))
+    n_cmds = len(list(pathlib.Path(tasks_dir).glob("task-*")))
     if n_cmds == 0:
-        click.echo(f"No task-*.sh scripts in: {tasks_dir}", err=True)
+        click.echo(f"No task-* scripts in: {tasks_dir}", err=True)
         sys.exit(1)
 
     tmp_dir, dirname = _upload_dir(tasks_dir)
