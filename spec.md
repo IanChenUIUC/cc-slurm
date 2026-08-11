@@ -409,9 +409,17 @@ The append-only JSONL log is the project's memory; `sacct` is SLURM's. Both
 `status` and `submit` reconcile the two by job id.
 
 - **reconcile** queries `sacct` once for every job whose last logged state is
-  non-terminal, folds the `.batch`/`.extern` sub-rows and array-task rows per job
-  id, and appends the observed terminal state plus `Elapsed` and peak `MaxRSS`.
-  Only `COMPLETED` is success; every other terminal state is resubmit-eligible.
+  non-terminal and appends what it observed. The fold is two-level, because a row
+  identifies a job *step* of an array *task* (`<base>_<idx>.batch`): each task's
+  state and `Elapsed` come from its own main row while its peak `MaxRSS` is the max
+  over its own steps — slurm reports `MaxRSS` on `.batch`, not on the main row — and
+  the tasks then fold into one state per unit. Only `COMPLETED` is success; every
+  other terminal state is resubmit-eligible.
+  The appended record carries the per-unit `state`/`elapsed`/`max_rss` **plus** a
+  `tasks` table (`index -> {state, elapsed, max_rss}`) for arrays; an individual job
+  has no task index and gets no table. A record whose observed fields are identical
+  to the previous one is **not** appended — a running array is re-observed on every
+  `status`, and re-logging an unchanged 240-task table records nothing new.
 - **submit** reconciles first, then runs only nodes whose latest state is not
   `COMPLETED` — failed, invalidated, absent, or force-listed — plus every node
   **downstream** of a rerun (its inputs are now stale). Live nodes
@@ -440,8 +448,10 @@ otherwise make SLURM reject the submission ("Job dependency problem").
   locally-run pipeline need no cluster access.
 
 Array units reconcile atomically: an array is `COMPLETED` only if all its tasks
-are, else the whole array is resubmit-eligible. (Per-task array resubmission via
-sparse `--array=` indices is a possible future refinement.)
+are, else the whole array is resubmit-eligible. Per-task state is *recorded and
+reported* (see the `tasks` table above and `status -v`), but not yet acted on —
+resubmission is still whole-array. (Per-task resubmission via sparse `--array=`
+indices is the natural next step now that the state exists.)
 
 - **`complete <glob>`** (persistent) appends a `COMPLETED` record for matching
   nodes, forcing them to success — for work re-run by hand outside the pipeline.
@@ -456,16 +466,24 @@ sparse `--array=` indices is a possible future refinement.)
   is *in the same wave* has no job id yet, so its dependency renders as
   `<unit-name>` while live and skipped parents show their real ids.
 
+- **`history [<glob>]`** reads the log without touching `sacct`: every record for
+  each matching unit, in order, tagged `submit` / `reconcile` / `force`. `status`
+  only ever shows the *latest* record, so a unit that timed out, was repaired, and
+  now reads `COMPLETED` looks identical to one that always succeeded; `history` is
+  where the earlier attempts, their job ids, and their measurements survive. A unit
+  with no records prints `(no history)`, which distinguishes *never submitted* from
+  *submitted and failed* — `status` reports both as `absent`.
+
 **Subcommands:** `dag [<glob>]`, `submit` (`--only`/`--rerun <glob>`, `--local`,
-`--dry`), `status` (`-v`), `invalidate <glob>`, `complete <glob>`,
-`cancel-ids [<glob>]`, `log-ids [<glob>]`. All accept `--workdir` (default
+`--dry`), `status` (`-v`), `history [<glob>]`, `invalidate <glob>`,
+`complete <glob>`, `cancel-ids [<glob>]`, `log-ids [<glob>]`. All accept `--workdir` (default
 `.pipeline`). Every glob matches **node identities**; `cancel-ids` additionally
 matches unit names in the log, so a live job whose recipe was since renamed or
 deleted is still cancellable.
 
 ### Which one do I reach for?
 
-The `justfile` shipped with the template maps these to seven verbs, each taking an
+The `justfile` shipped with the template maps these to eight verbs, each taking an
 optional glob, with the behaviour flags as `just` variable overrides (which must
 precede the recipe name):
 
@@ -482,12 +500,29 @@ precede the recipe name):
 | tell the DAG about work you did by hand | `just complete 'testing-*'` |
 | stop live jobs | `just cancel 'testing-*'` |
 | read the output | `just status`, `just logs 'testing-*'` |
+| find out which tasks of an array failed | `just verbose=1 status 'testing-*'` |
+| see earlier attempts, not just the latest | `just history 'testing-*'` |
 
 **`status` roll-up.** Any recipe that expands to **more than one unit** — an
 `array_axes` split *or* an individual-job fan-out — prints as **one** summary line,
-`recipe  [N arrays|jobs]  n COMPLETED · n RUNNING · …`, so the listing stays compact.
-`status -v` expands it to one row per unit; a recipe with a single unit always prints
-that unit's row.
+`recipe  [N arrays, M tasks]  n COMPLETED · n FAILED · …`, so the listing stays
+compact. The histogram counts **tasks**, not units, so three failed tasks inside a
+240-task array are visible rather than reading as one failed array; the task count is
+omitted for an individual-job fan-out, where it would just repeat the unit count.
+
+`status -v` expands to one row per unit and, beneath it, names the tasks whose own
+state is not `COMPLETED`:
+
+```
+testing-csk:bitcoin                      FAILED       01:12:33   38G
+      failed    testing-csk-bitcoin-13-1-100
+      timeout   testing-csk-bitcoin-14-1-1
+```
+
+It stays silent when *every* task shares the unit's state — the row already said
+that, and listing 240 identical identities is noise. A record with no `tasks` table
+(any record written before per-task folding existed, or an individual job) degrades
+to the unit-level line rather than failing.
 
 ---
 

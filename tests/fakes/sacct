@@ -4,10 +4,23 @@
 Stands in for SLURM's `sacct`. The engine calls:
   sacct -j <id,id,...> --format=JobID,State,ExitCode,Elapsed,MaxRSS --parsable2 --noheader
 
-For each requested id present in `$SACCT_STATES` (JSON: id -> {state, elapsed,
-maxrss}), emit one `--parsable2` row. Ids absent from the map produce no row —
-the engine treats that as "not in sacct yet: leave live", exactly as a real
-just-submitted job that hasn't landed in accounting.
+For each requested id present in `$SACCT_STATES` (JSON: id -> entry), emit its
+`--parsable2` rows. Ids absent from the map produce no row — the engine treats that
+as "not in sacct yet: leave live", exactly as a real just-submitted job that hasn't
+landed in accounting.
+
+An entry is either a plain job:
+
+    {"state": "COMPLETED", "elapsed": "00:00:30", "maxrss": "100M"}
+
+or an array, whose `tasks` map index -> a bare state or a per-task dict:
+
+    {"tasks": {"0": "COMPLETED", "17": {"state": "FAILED", "maxrss": "40G"}}}
+
+Row shape mirrors slurm's: each task emits its own main row `<id>_<idx>` with an
+**empty** MaxRSS plus a `<id>_<idx>.batch` step row carrying MaxRSS. That split is
+the thing the engine's two-level fold exists to handle, so the fake has to reproduce
+it rather than flattening it.
 """
 import json
 import os
@@ -22,18 +35,33 @@ def requested_ids(argv):
     return []
 
 
+def row(jid, state, elapsed, maxrss):
+    print(f"{jid}|{state}|0:0|{elapsed}|{maxrss}")
+
+
+def emit(jid, info):
+    tasks = info.get("tasks")
+    if not tasks:
+        row(jid, info["state"], info.get("elapsed", "00:00:30"),
+            info.get("maxrss", "100M"))
+        return
+    for idx, t in tasks.items():
+        t = {"state": t} if isinstance(t, str) else t
+        elapsed = t.get("elapsed", info.get("elapsed", "00:00:30"))
+        maxrss = t.get("maxrss", info.get("maxrss", "100M"))
+        row(f"{jid}_{idx}", t["state"], elapsed, "")       # main row: no MaxRSS
+        row(f"{jid}_{idx}.batch", t["state"], elapsed, maxrss)
+        row(f"{jid}_{idx}.extern", t["state"], elapsed, "")
+
+
 def main():
     argv = sys.argv[1:]
     states_path = os.environ.get("SACCT_STATES")
     states = json.loads(pathlib.Path(states_path).read_text()) if states_path else {}
     for jid in requested_ids(argv):
         info = states.get(str(jid))
-        if not info:
-            continue
-        state = info["state"]
-        elapsed = info.get("elapsed", "00:00:30")
-        maxrss = info.get("maxrss", "100M")
-        print(f"{jid}|{state}|0:0|{elapsed}|{maxrss}")
+        if info:
+            emit(jid, info)
 
 
 if __name__ == "__main__":

@@ -22,3 +22,14 @@ params  = { dataset = ["a", "b"], rep = ["0", "1", "2"] }
 command = "echo down ${dataset} ${rep}"
 slurm   = { cpus = 1 }
 """
+
+# One recipe split into several arrays by `array_axes`, mirroring `testing-csk`
+# (7 arrays of 60). Here: 2 arrays of 3, so `status` rolls the recipe up and the
+# task histogram has to count across units rather than within one.
+SPLIT = """
+[recipe.wide]
+array      = true
+array_axes = ["rep"]
+params     = { dataset = ["a", "b"], rep = ["0", "1", "2"] }
+command    = "echo wide ${dataset} ${rep}"
+"""

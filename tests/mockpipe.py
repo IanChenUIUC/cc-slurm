@@ -76,6 +76,17 @@ class Result:
     def ok(self):
         return self.returncode == 0
 
+    @property
+    def latest(self):
+        """unit -> its last log record, the same fold the engine's state read does."""
+        return {r["unit"]: r for r in self.log}
+
+    def tasks(self, unit):
+        """{index: state} the engine folded out of sacct for one unit's array tasks,
+        or {} if the unit has no per-task detail."""
+        rec = self.latest.get(unit) or {}
+        return {i: t["state"] for i, t in (rec.get("tasks") or {}).items()}
+
 
 def _norm_state(entry, idx):
     """(state, job_id) for a `state` value that is either a bare STATE or
@@ -88,10 +99,25 @@ def _norm_state(entry, idx):
 
 
 def _seed(state):
-    """Translate {unit: STATE|(STATE,id)} into (log_records, sacct_states)."""
+    """Translate {unit: SEED} into (log_records, sacct_states), where SEED is a bare
+    STATE, a (STATE, id) pair, or — for an array whose tasks differ — a dict
+
+        {"tasks": {0: "COMPLETED", 17: "FAILED", ...}, "id": "90500"}
+
+    A task dict is always seeded *live* (SUBMITTED + id, registered with the fake
+    sacct), because the whole point is to let the engine's own fold decide the
+    unit-level state from the per-task rows rather than asserting it here."""
     records, sacct = [], {}
     for idx, unit in enumerate(sorted(state)):
-        st, jid = _norm_state(state[unit], idx)
+        entry = state[unit]
+        if isinstance(entry, dict):
+            jid = str(entry.get("id", SEED_ID_BASE + idx))
+            records.append({"unit": unit, "kind": "array", "job_id": jid,
+                            "state": "SUBMITTED"})
+            sacct[jid] = {k: v for k, v in entry.items() if k != "id"}
+            sacct[jid]["tasks"] = {str(k): v for k, v in entry["tasks"].items()}
+            continue
+        st, jid = _norm_state(entry, idx)
         if st in RUNNINGISH:
             records.append({"unit": unit, "kind": "array", "job_id": jid,
                             "state": "SUBMITTED"})
@@ -175,16 +201,19 @@ def _parse_jobids(stdout):
     return ids
 
 
-def mock_run(spec, state, action, *args, idmap=None, workdir=None):
+def mock_run(spec, state, action, *args, idmap=None, workdir=None, extra_log=()):
     """Run `pipeline.py <action> <args>` against a mocked state. `spec` is TOML
-    text; `state` is {unit: STATE|(STATE, id)}. Returns a Result."""
+    text; `state` is {unit: SEED} (see `_seed`). `extra_log` records are appended
+    after the seeds, for cases that need a specific *prior* log — an earlier attempt
+    to show in `history`, or an already-observed state to test dedup against.
+    Returns a Result."""
     wd = pathlib.Path(workdir) if workdir else pathlib.Path(tempfile.mkdtemp(prefix="mockpipe-"))
     (wd / ".pipeline").mkdir(parents=True, exist_ok=True)
     (wd / "spec.toml").write_text(spec)
 
     records, sacct = _seed(state)
     (wd / ".pipeline" / "run.jsonl").write_text(
-        "".join(json.dumps(r) + "\n" for r in records))
+        "".join(json.dumps(r) + "\n" for r in [*records, *extra_log]))
 
     capture = wd / ".pipeline" / "cc_capture.jsonl"
     sacct_path = wd / ".pipeline" / "sacct_states.json"

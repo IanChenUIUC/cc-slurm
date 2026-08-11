@@ -13,6 +13,10 @@ the template (`gen-template.sh` copies only the four runners).
   no cluster. Dual-use: a CLI ("is this fixed?" checker) and the `mock_run` library
   the tests import. Fakes under `fakes/` stand in for `cc-submit` (records what would
   be submitted) and `sacct` (scripts job states). See its module docstring.
+  A unit seeded as `{"tasks": {0: "COMPLETED", 1: "FAILED"}}` is surfaced through the
+  fake `sacct` as per-task main + `.batch` rows, so the *engine's* fold decides the
+  unit state rather than the test asserting it. `extra_log=` seeds prior records for
+  cases that need a specific history.
 - `conftest.py` — fixtures `mock_run` (black-box, primary) and `engine` (white-box,
   the loaded module for `Engine(...)` internals).
 - `specs.py` — reusable spec fragments.
@@ -34,7 +38,10 @@ the template (`gen-template.sh` copies only the four runners).
 | §9  | array eligibility errors, `array_axes` split, `max_array_size`, dep-translation table (`aftercorr` vs `afterok`) | TODO | — |
 | §11 | reconcile folds sacct; skip-COMPLETED; FAILED resubmit-eligible; live left untouched; rerun → downstream stale; completed-parent edge dropped | ✅ | `test_execution.py` |
 | §11 | `--only`: parent COMPLETED / live(→afterok) / in-run / absent / FAILED; `--local` rejects stale live | ✅ | `test_only.py` |
-| §11 | `status` roll-up (`-v` expand) | TODO | — |
+| §11 | `status` roll-up: task-level histogram, `-v` expands and names non-COMPLETED tasks, silent when the whole unit shares one state, degrades for a record with no `tasks` | ✅ | `test_tasks.py` |
+| §11 | reconcile's two-level fold: per-task state/elapsed/RSS, unit verdict unchanged, RSS not smeared across tasks, no `tasks` key for an individual job, pending `_[a-b]` range is not a task, unchanged observation not re-appended | ✅ | `test_tasks.py` |
+| §11 | `history`: every attempt in order, event labels (incl. inferred for pre-`event` records), `(no history)` vs a failed attempt, glob restriction, task histogram | ✅ | `test_history.py` |
+| §11 | a partly-failed array is still resubmitted **whole** (per-task resubmission is not implemented) | ✅ | `test_tasks.py` |
 | §11 | `submit --dry`: submits nothing, logs no submission, still materializes; plans only what needs running; matches a real submit's units/deps/flags; in-wave parents as `<placeholders>`; honors `--only` preconditions and `--rerun` | ✅ | `test_dry.py` |
 | §11 | `cancel-ids`: omits terminal, honors globs, still reaches units absent from the spec | ✅ | `test_verbs.py` |
 | §11 | `dag <glob>` restricts units but keeps edges to parents outside the glob | ✅ | `test_verbs.py` |
@@ -60,6 +67,14 @@ the template (`gen-template.sh` copies only the four runners).
 | both `command` and `command_file`; unreadable `command_file` | ✅ | `test_command_file.py` |
 
 ## Notes / spec drift
+
+- **The fake `sacct`'s row shape is confirmed against the cluster** (2026-08-11). Real
+  rows are in `tests/sacct_sample.txt` and `test_tasks.py::test_fold_matches_real_sacct_output`
+  folds them directly, so the assumption is now pinned rather than believed: a task's
+  main row carries **no** MaxRSS, `.batch` carries it in `K`, `.extern` carries none —
+  and `.extern` can report one second *more* elapsed than the main row, which is why
+  elapsed comes from the main row rather than a max over the steps. `sacct` still does
+  not exist on the dev box, so refresh the sample if the cluster's format ever changes.
 
 - **`-C` vs `--aftercorr`** — resolved. `spec.md` §8 now documents `-C <id>` (and `-d`
   for `afterok`), matching what `_cmd` emits and what the tests assert.

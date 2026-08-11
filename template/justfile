@@ -9,7 +9,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 #                                       #   AND everything downstream
 #   just force=1 only=1 run 'testing-*' # the job flaked: redo these alone and leave
 #                                       #   downstream results in place
-#   just verbose=1 status               # expand rolled-up multi-unit recipes
+#   just verbose=1 status               # expand rolled-up recipes and name failed tasks
 #   just spec=other.toml dag            # any variable below can be overridden this way
 #
 # (`just` only accepts overrides ahead of the recipe name; anything after it is a
@@ -54,12 +54,21 @@ dry glob='*':
            else { if only == '' { "--rerun '" + glob + "'" } \
                   else { "--only '" + glob + "' --rerun '" + glob + "'" } } }}
 
-# Multi-unit recipes roll up to one line; `just verbose=1 status` expands them.
+# Multi-unit recipes roll up to one line, counting *tasks* rather than units, so a
+# 3-task failure inside a 240-task array is visible. `just verbose=1 status` expands
+# to one row per unit and names the tasks that did not complete.
 
 # Each unit's state, elapsed time, and peak RSS.
 status glob='*':
     python3 pipeline.py status {{spec}} --workdir '{{workdir}}' --sacct '{{sacct}}' \
         {{ if verbose == '' { '' } else { '-v' } }}
+
+# Reach for it when `status` isn't enough because the interesting attempt is not
+# the latest one — a unit that timed out, was repaired, and now reads COMPLETED.
+
+# Every logged attempt per unit: when, what happened, job id, state, RSS.
+history glob='*':
+    python3 pipeline.py history {{spec}} '{{glob}}' --workdir '{{workdir}}'
 
 # ---- running ---------------------------------------------------------------
 

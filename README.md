@@ -12,13 +12,15 @@ A format for specifying these as a toml is described, and parsed.
 
 Using the `just` command runner is easy, and can understand the subcommands.
 
-Seven verbs, each taking an optional glob over node identities:
+Eight verbs, each taking an optional glob over node identities:
 
 - default: lists the commands
 - dag: the dependency structure the spec expanded into
 - dry: exactly what `run` would submit, and why — same decisions, printed
 - run: submits whatever isn't COMPLETED, plus anything downstream
-- status: state, elapsed time, and peak RSS per unit
+- status: state, elapsed time, and peak RSS per unit (task-level counts;
+  `verbose=1` names the tasks of an array that didn't complete)
+- history: every logged attempt per unit, not just the latest one
 - logs: tails the SLURM and local-run logs
 - invalidate / complete: mark units stale / force them to success
 - cancel: scancel matching live jobs

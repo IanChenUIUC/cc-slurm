@@ -6,6 +6,7 @@ emit cc-submit calls.
     pipeline.py submit     spec.toml           # materialize scripts, submit, log ids
     pipeline.py submit     spec.toml --dry     # ...same decisions, print instead
     pipeline.py status     spec.toml [-v]      # state / elapsed / peak RSS per unit
+    pipeline.py history    spec.toml [<glob>]  # every logged attempt, per unit
     pipeline.py invalidate spec.toml <glob>    # mark stale: next submit reruns it
     pipeline.py complete   spec.toml <glob>    # force to success (ran it by hand)
     pipeline.py cancel-ids spec.toml [<glob>]  # live job ids, for scancel
@@ -48,6 +49,11 @@ SLURM_BOOL_FLAGS = {"exclusive": "-x"}
 RUNNINGISH = {"RUNNING", "PENDING", "REQUEUED", "SUSPENDED",
               "COMPLETING", "CONFIGURING", "RESIZING"}
 NON_TERMINAL = RUNNINGISH | {"SUBMITTED", "UNKNOWN"}
+# The fields a reconcile record observes; if none of them moved, there is nothing
+# new to append to the log.
+OBSERVED = ("state", "elapsed", "max_rss", "tasks")
+# How many failing task identities `status -v` names before summarizing the rest.
+FAILURES_SHOWN = 10
 VAR = re.compile(r"\$\{([^}]+)\}")
 CAP = re.compile(r"^([\w-]+)\s*\((.*)\)\s*$")   # recipe names are TOML bare keys (may contain '-')
 RANGE = re.compile(r"^(-?\d+)\.\.(-?\d+)$")
@@ -631,14 +637,20 @@ class Engine:
                               capture_output=True, text=True)
 
     @staticmethod
-    def _read_log(log_path):
-        last = {}
+    def _read_log_all(log_path):
+        """Every record in the log, in order, grouped by unit. `run.jsonl` is
+        append-only, so this is the full attempt history."""
+        out = defaultdict(list)
         if log_path.exists():
             for ln in log_path.read_text().splitlines():
                 if ln.strip():
                     r = json.loads(ln)
-                    last[r["unit"]] = r
-        return last
+                    out[r["unit"]].append(r)
+        return out
+
+    @classmethod
+    def _read_log(cls, log_path):
+        return {unit: recs[-1] for unit, recs in cls._read_log_all(log_path).items()}
 
     # ---- sacct reconciliation ----
     @staticmethod
@@ -662,32 +674,58 @@ class Engine:
             raise PipelineError(f"sacct failed: {proc.stderr}")
         return [ln.split("|") for ln in proc.stdout.splitlines() if ln.strip()]
 
+    @staticmethod
+    def _fold_states(states):
+        """One verdict for a set of task states: success only if all succeeded,
+        otherwise live beats terminal and the first failure names the outcome."""
+        if not states:
+            return "UNKNOWN"
+        if all(st == "COMPLETED" for st in states):
+            return "COMPLETED"
+        if any(st in RUNNINGISH for st in states):
+            return "RUNNING"
+        return next(st for st in states if st != "COMPLETED")
+
     def _parse_sacct(self, rows):
-        """Fold sacct rows (main + .batch/.extern, array tasks) per base job id."""
-        groups = defaultdict(list)
+        """Fold sacct rows into one record per base job id, keeping per-task detail.
+
+        Two levels, because a row identifies a job *step* of an array *task*:
+        `<base>_<idx>.batch`. Level one groups by stepless id, so each task's state
+        and elapsed come from its own main row while its peak RSS is the max over its
+        own rows -- slurm reports MaxRSS on `.batch`, not on the main row, which is
+        why a single flat fold both mixes the two and smears the worst task's RSS
+        across the whole array. Level two folds an array's tasks into the per-unit
+        verdict, which is what `submit` reads and is unchanged.
+
+        A pending array appears as a range (`<base>_[5-239]`), so only a numeric
+        index becomes a task; a base id with no numeric index at all (an individual
+        job) gets no `tasks` key.
+        """
+        tasks = {}
         for r in rows:
             if len(r) < 5:
                 continue
             jid, state, _exit, elapsed, maxrss = r[:5]
-            stepless = jid.split(".")[0]                # strip .batch/.extern
-            base = stepless.split("_")[0]              # array base id
-            groups[base].append((("." in jid), self._norm_state(state),
-                                 elapsed, self._parse_rss(maxrss)))
+            stepless, _, step = jid.partition(".")
+            t = tasks.setdefault(stepless, {"state": None, "elapsed": "-", "max_rss": 0})
+            t["max_rss"] = max(t["max_rss"], self._parse_rss(maxrss))
+            if not step:
+                t["state"] = self._norm_state(state)
+                t["elapsed"] = elapsed
+        groups = defaultdict(dict)
+        for stepless, t in tasks.items():
+            base, _, idx = stepless.partition("_")
+            groups[base][idx] = t
         out = {}
-        for base, entries in groups.items():
-            mains = [(st, el) for is_step, st, el, _ in entries if not is_step]
-            states = [st for st, _ in mains]
-            if not states:
-                ust = "UNKNOWN"
-            elif all(st == "COMPLETED" for st in states):
-                ust = "COMPLETED"
-            elif any(st in RUNNINGISH for st in states):
-                ust = "RUNNING"
-            else:
-                ust = next(st for st in states if st != "COMPLETED")   # a failure
-            rss = max((r[3] for r in entries), default=0)
-            elapsed = max((el for _, el in mains), default="-")
-            out[base] = {"state": ust, "max_rss": rss, "elapsed": elapsed}
+        for base, per_task in groups.items():
+            ts = list(per_task.values())
+            rec = {"state": self._fold_states([t["state"] for t in ts if t["state"]]),
+                   "max_rss": max((t["max_rss"] for t in ts), default=0),
+                   "elapsed": max((t["elapsed"] for t in ts), default="-")}
+            indexed = {i: t for i, t in per_task.items() if i.isdigit()}
+            if indexed:
+                rec["tasks"] = {i: indexed[i] for i in sorted(indexed, key=int)}
+            out[base] = rec
         return out
 
     def reconcile(self, sacct, log_path):
@@ -707,7 +745,15 @@ class Engine:
                     continue
                 nr = {"unit": name, "kind": rec.get("kind"), "job_id": rec["job_id"],
                       "state": info["state"], "max_rss": info["max_rss"],
-                      "elapsed": info["elapsed"], "time": time.time(), "reconcile": True}
+                      "elapsed": info["elapsed"], "event": "reconcile",
+                      "time": time.time(), "reconcile": True}
+                if "tasks" in info:
+                    nr["tasks"] = info["tasks"]
+                # A running array is re-observed on every status; appending an
+                # identical record would grow the log (and a 240-task table) without
+                # recording anything new, so only a changed observation is logged.
+                if all(rec.get(k) == nr.get(k) for k in OBSERVED):
+                    continue
                 new.append(nr)
                 updates[name] = nr
             if new:
@@ -727,16 +773,58 @@ class Engine:
                 return f"{b:.0f}{unit}"
             b /= 1024
 
+    def _task_states(self, u, rec):
+        """{node: state} for one unit's tasks.
+
+        Uses sacct's per-task table when the record carries one, and otherwise
+        attributes the unit's own state to every node -- which is exactly what an
+        individual job, a record written before per-task folding existed, and a
+        never-submitted unit all legitimately look like."""
+        st = (rec or {}).get("state", "absent")
+        tasks = (rec or {}).get("tasks") or {}
+        return {n: (tasks.get(str(n.array_index)) or {}).get("state", st)
+                for n in u.nodes}
+
+    @staticmethod
+    def _hist(counts):
+        return " · ".join(f"{counts[s]} {s}" for s in sorted(counts))
+
     def status(self, sacct, workdir=".pipeline", verbose=False):
+        """Per-unit state, rolled up by recipe. The histogram counts *tasks*, not
+        units, so a 3-task failure inside a 240-task array is visible; `verbose`
+        expands to one row per unit and names the tasks that did not complete."""
         state = self.reconcile(sacct, pathlib.Path(workdir) / "run.jsonl")
         print(f"{'unit':40} {'state':12} {'elapsed':10} maxrss")
 
-        def row(name, rec):
+        def row(name, rec, suffix=""):
             if rec:
                 print(f"{name:40} {rec.get('state','?'):12} "
-                      f"{str(rec.get('elapsed','-')):10} {self._fmt_rss(rec.get('max_rss'))}")
+                      f"{str(rec.get('elapsed','-')):10} "
+                      f"{self._fmt_rss(rec.get('max_rss'))}{suffix}")
             else:
                 print(f"{name:40} {'absent':12}")
+
+        def failures(u, rec):
+            """Name the tasks whose own state is not COMPLETED. Silent when every
+            task shares the unit's state -- the row already said that, and listing
+            240 identical identities is noise."""
+            per_task = self._task_states(u, rec)
+            bad = [(n, st) for n, st in sorted(per_task.items(),
+                                               key=lambda kv: kv[0].array_index or 0)
+                   if st != "COMPLETED"]
+            if len(bad) == len(u.nodes):
+                return
+            for n, st in bad[:FAILURES_SHOWN]:
+                print(f"      {st.lower():9} {n.ident}")
+            if len(bad) > FAILURES_SHOWN:
+                print(f"      ... (+ {len(bad) - FAILURES_SHOWN} more)")
+
+        def counts(us):
+            c = defaultdict(int)
+            for u in us:
+                for st in self._task_states(u, state.get(u.name)).values():
+                    c[st] += 1
+            return c
 
         # cluster units by originating recipe, preserving unit_order (position of
         # each recipe's first unit); any recipe with >1 unit (array groups or an
@@ -750,16 +838,26 @@ class Engine:
             groups[pos[key]][1].append(u)
 
         for key, us in groups:
-            if verbose or len(us) == 1:
+            if verbose:
                 for u in us:
-                    row(u.name, state.get(u.name))
+                    rec = state.get(u.name)
+                    row(u.name, rec)
+                    if rec:
+                        failures(u, rec)
+            elif len(us) == 1:
+                u, rec = us[0], state.get(us[0].name)
+                c = counts(us)
+                # A single unit already shows its own state; the histogram only adds
+                # something when its tasks disagree with each other.
+                row(u.name, rec, f"   {self._hist(c)}" if len(c) > 1 else "")
             else:
-                counts = defaultdict(int)
-                for u in us:
-                    counts[(state.get(u.name) or {}).get("state", "absent")] += 1
-                summary = " · ".join(f"{counts[s]} {s}" for s in sorted(counts))
+                ntasks = sum(len(u.nodes) for u in us)
                 noun = "arrays" if us[0].kind == "array" else "jobs"
-                print(f"{key:40} [{len(us)} {noun}]  {summary}")
+                # An individual-job fan-out has one node per unit, so a task count
+                # would just repeat the unit count.
+                scale = f"{len(us)} {noun}" + (f", {ntasks} tasks"
+                                               if ntasks != len(us) else "")
+                print(f"{key:40} [{scale}]  {self._hist(counts(us))}")
 
     def _matching_units(self, globs, units=None):
         return [u for u in (units if units is not None else self.units)
@@ -792,6 +890,45 @@ class Engine:
                 continue
             print(f"slurm-{jid}_*.out" if u.kind == "array" else f"slurm-{jid}.out")
 
+    @staticmethod
+    def _event(rec):
+        """The event label for a record. Written explicitly since R5; inferred for
+        older records, which distinguished themselves only by a `reconcile` flag or
+        by carrying a forced state."""
+        if rec.get("event"):
+            return rec["event"]
+        if rec.get("reconcile"):
+            return "reconcile"
+        return "force" if rec.get("state") in ("INVALIDATED", "COMPLETED") else "submit"
+
+    def history(self, globs=("*",), workdir=".pipeline"):
+        """Every logged attempt per matching unit, in order: when, what happened, the
+        job id, the observed state, and the per-task histogram once one was recorded.
+
+        `run.jsonl` is append-only, so this is the one view that survives a retry --
+        `status` only ever shows the latest record, which makes a job that timed out
+        and was then rerun indistinguishable from one that always succeeded."""
+        hist = self._read_log_all(pathlib.Path(workdir) / "run.jsonl")
+        for u in self._matching_units(globs, self.unit_order):
+            print(u.name)
+            recs = hist.get(u.name, [])
+            if not recs:
+                print("  (no history)")
+                continue
+            for rec in recs:
+                when = time.strftime("%m-%d %H:%M", time.localtime(rec.get("time", 0)))
+                cols = [f"  {when}  {self._event(rec):9} {str(rec.get('job_id') or '-'):8} "
+                        f"{rec.get('state', '?'):13}"]
+                if rec.get("elapsed") or rec.get("max_rss"):
+                    cols.append(f" {str(rec.get('elapsed') or '-'):11} "
+                                f"{self._fmt_rss(rec.get('max_rss')) or '-':6}")
+                if rec.get("tasks"):
+                    c = defaultdict(int)
+                    for t in rec["tasks"].values():
+                        c[t.get("state", "UNKNOWN")] += 1
+                    cols.append(" " + self._hist(c))
+                print("".join(cols).rstrip())
+
     def _force_state(self, globs, state, verb, workdir):
         """Append a `state` record for every unit matching a glob, carrying the prior
         job_id so `logs`/`cancel` still resolve."""
@@ -807,7 +944,7 @@ class Engine:
             for u in matched:
                 f.write(json.dumps({"unit": u.name, "kind": u.kind,
                                     "job_id": (last.get(u.name) or {}).get("job_id"),
-                                    "state": state,
+                                    "state": state, "event": "force",
                                     "nodes": [n.ident for n in u.nodes],
                                     "time": time.time()}) + "\n")
                 print(f"{verb} {u.name}")
@@ -897,7 +1034,8 @@ class Engine:
 
         def record(u, jid, st):
             return json.dumps({"unit": u.name, "kind": u.kind, "job_id": jid, "state": st,
-                               "nodes": [n.ident for n in u.nodes], "time": time.time()}) + "\n"
+                               "event": "submit", "nodes": [n.ident for n in u.nodes],
+                               "time": time.time()}) + "\n"
 
         # An in-wave parent has no id yet, while a live or skipped one keeps its logged
         # id, so a dry run's dependency tokens are legitimately a mix of real and
@@ -941,8 +1079,9 @@ class Unit:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["dag", "submit", "status", "invalidate",
-                                       "complete", "cancel-ids", "log-ids"])
+    ap.add_argument("action", choices=["dag", "submit", "status", "history",
+                                       "invalidate", "complete", "cancel-ids",
+                                       "log-ids"])
     ap.add_argument("spec")
     ap.add_argument("globs", nargs="*",
                     help="node-identity globs (for invalidate / complete / log-ids)")
@@ -973,6 +1112,8 @@ def main():
             eng.dag(args.globs or ["*"])
         elif args.action == "status":
             eng.status(sacct=args.sacct, workdir=wd, verbose=args.verbose)
+        elif args.action == "history":
+            eng.history(args.globs or ["*"], workdir=wd)
         elif args.action == "invalidate":
             eng.invalidate(args.globs, workdir=wd)
         elif args.action == "complete":
