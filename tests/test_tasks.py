@@ -119,7 +119,6 @@ def test_status_histogram_counts_pending_tasks(mock_run):
     seed = {"id": "700", "tasks": {"0": "RUNNING", "[1-5]": "PENDING"}}
     r = mock_run(FANIN, {"down": seed}, "status")
     line = next(ln for ln in r.stdout.splitlines() if ln.startswith("down "))
-    assert "RUNNING" in line.split()[1]
     assert "5 PENDING · 1 RUNNING" in line
 
 

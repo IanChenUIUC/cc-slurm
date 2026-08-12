@@ -45,10 +45,37 @@ SLURM_FLAGS = {"cpus": "-c", "mem": "-m", "partition": "-p", "time": "-t"}
 # Valueless slurm keys: truthy in the recipe -> the flag is emitted with no value.
 SLURM_BOOL_FLAGS = {"exclusive": "-x"}
 # Job states. Only COMPLETED is success; everything else terminal is a failure
-# (and thus resubmit-eligible). NON_TERMINAL states are still live: skip them.
-RUNNINGISH = {"RUNNING", "PENDING", "REQUEUED", "SUSPENDED",
-              "COMPLETING", "CONFIGURING", "RESIZING"}
-NON_TERMINAL = RUNNINGISH | {"SUBMITTED", "UNKNOWN"}
+# (and thus resubmit-eligible); a live job is skipped -- see `is_live`.
+# Live states, most advanced first: a unit's verdict is the furthest-along state any
+# of its tasks is actually in, so an all-pending array reads PENDING, not RUNNING.
+LIVE_ORDER = ("COMPLETING", "RUNNING", "RESIZING", "SUSPENDED", "CONFIGURING",
+              "REQUEUED", "PENDING")
+RUNNINGISH = set(LIVE_ORDER)
+NON_TERMINAL = RUNNINGISH | {"SUBMITTED", "UNKNOWN"}   # states we name as live
+# Liveness is decided by the *terminal* list, not the live one: slurm owns this
+# vocabulary, and a state we have never heard of is far likelier to be a live job we
+# would otherwise submit a second time than a finished one worth resubmitting. An
+# unknown state therefore reads as live (and shows up, named, in `status`); the cost
+# of being wrong is one `invalidate`.
+TERMINAL = {"COMPLETED", "FAILED", "TIMEOUT", "CANCELLED", "OUT_OF_MEMORY",
+            "NODE_FAIL", "BOOT_FAIL", "DEADLINE", "PREEMPTED", "REVOKED",
+            "SPECIAL_EXIT", "INVALIDATED"}
+# Display classes. Anything unlisted paints as a failure and keeps its own name in
+# the histogram: `status` is where an unrecognized state most needs to stand out,
+# even though `is_live` deliberately treats it as live for submission.
+CLASS_ORDER = ("completed", "running", "waiting", "failed")
+STATE_CLASS = {"COMPLETED": "completed",
+               **{s: "running" for s in ("RUNNING", "COMPLETING", "SUSPENDED",
+                                         "RESIZING", "CONFIGURING", "REQUEUED",
+                                         "SUBMITTED", "UNKNOWN")},
+               "PENDING": "waiting", "ABSENT": "waiting"}
+# Colored, every class is a solid block and the hue carries the distinction -- the
+# shade glyphs blend with the background, which renders the same color code visibly
+# dimmer than the histogram text beside it. Uncolored, the shades are all there is.
+GLYPH = {"completed": "█", "running": "▒", "waiting": "░", "failed": "▓"}
+SOLID = "█"
+COLORS = {"completed": "32", "running": "36", "waiting": "33", "failed": "31"}
+BAR_WIDTH = 20
 # The fields a reconcile record observes; if none of them moved, there is nothing
 # new to append to the log.
 OBSERVED = ("state", "elapsed", "max_rss", "tasks")
@@ -98,6 +125,33 @@ def expand_ranges(v) -> Any:
                 raise PipelineError(f"range {v!r}: end is below start")
             return list(range(lo, hi + 1))
     return v
+
+
+def state_class(st):
+    """Which of the four display classes a state paints as. Anything slurm grew since
+    this list was written paints as a failure and keeps its own name in the histogram,
+    so an unrecognized state stands out rather than hiding in the green."""
+    return STATE_CLASS.get(st, "failed")
+
+
+def is_live(st):
+    """A job in this state is still the cluster's problem -- do not resubmit it."""
+    return st is not None and st not in TERMINAL
+
+
+def _seconds(elapsed):
+    """Slurm's [D-]HH:MM:SS as a number, so durations compare as durations. A string
+    compare puts a 26-hour "1-02:00:00" below "23:00:00"."""
+    d, _, hms = (elapsed or "").partition("-")
+    if not hms:
+        d, hms = "0", d
+    parts = [p for p in hms.split(":") if p.isdigit()]
+    if not parts or not d.isdigit():
+        return -1
+    out = 0
+    for p in parts:
+        out = out * 60 + int(p)
+    return int(d) * 86400 + out
 
 
 def scalar_items(binding):
@@ -586,6 +640,32 @@ class Engine:
                     afterok.extend(pids)
         return afterok, aftercorr
 
+    def _doomed_afterok(self, u, state):
+        """(parent unit, failed task count) for every afterok parent of `u` that is
+        still live but already has failed tasks.
+
+        afterok is satisfied only if *every* task of the parent succeeds, so such an
+        edge can never be satisfied and slurm will kill the child once the parent
+        finishes. aftercorr is per-task -- task i waits on parent task i -- so a
+        partially failed aftercorr parent is exempt, and its healthy tasks proceed."""
+        byname = {x.name: x for x in self.units}
+        out = []
+        for tok in self._dep_tokens(u, lambda pu: pu.name)[0]:
+            pu, idx = byname.get(tok), None
+            if pu is None:                            # "<unit>_<index>": one array element
+                base, _, idx = tok.rpartition("_")
+                pu = byname.get(base)
+            rec = state.get(pu.name) if pu else None
+            if not rec or not is_live(rec.get("state")):
+                continue
+            bad = [n for n, st in self._task_states(pu, rec).items()
+                   if not is_live(st) and st != "COMPLETED"]
+            if idx is not None:
+                bad = [n for n in bad if str(n.array_index) == idx]
+            if bad:
+                out.append((pu, len(bad)))
+        return out
+
     def _cmd(self, u, uid, script, keep=None):
         afterok, aftercorr = self._dep_tokens(u, uid, keep)
         deps = " ".join(f"-d {t}" for t in afterok)
@@ -601,23 +681,60 @@ class Engine:
             return f"cc-submit sbatch {script} -j {u.name} {flags} {deps}".rstrip()
         return f"cc-submit array {script} -j {u.name} {flags} {deps}".rstrip()
 
+    def _edge_recipes(self, u):
+        """(afterok, aftercorr) as sorted parent *recipe* names, so the sibling units
+        of a fan-out compare equal -- `testing-steiner:bitcoin` and its six siblings
+        all depend on the same three recipes."""
+        recipe = {x.name: (x.recipe or x.name) for x in self.units}
+
+        def name(tok):
+            return recipe.get(tok) or recipe.get(tok.rpartition("_")[0], tok)
+
+        return tuple(tuple(sorted({name(t) for t in toks}))
+                     for toks in self._dep_tokens(u, lambda x: x.name))
+
     # ---- subcommands ----
-    def dag(self, globs=("*",), verbose=False):
-        # Dependency tokens still name parents outside the glob -- that is the edge
-        # you most want to see when inspecting a subset. Array tasks are listed only
-        # under `verbose`: a real spec has thousands of them, which buries the unit
-        # headers and edges that are the point of the view.
-        for u in self._matching_units(globs, self.unit_order):
-            head = (f"[array {len(u.nodes)}]" if u.kind == "array" else "[job]")
-            print(f"{head} {u.name}")
-            if u.kind == "array" and verbose:
-                for n in sorted(u.nodes, key=self._sortkey):
-                    print(f"    task {n.array_index}: {n.ident}")
-            afterok, aftercorr = self._dep_tokens(u, lambda x: x.name)
-            if afterok:
-                print(f"    afterok:   {', '.join(afterok)}")
-            if aftercorr:
-                print(f"    aftercorr: {', '.join(aftercorr)}")
+    def dag(self, globs=("*",), verbose=0):
+        """The resolved DAG. Grouped by recipe, one line each, because a real spec
+        fans out into units that repeat both the header and identical edges.
+
+        Dependency tokens still name parents outside the glob -- that is the edge you
+        most want to see when inspecting a subset. `verbose` expands a recipe to its
+        units, and again (-vv) to each array's tasks."""
+        units = self._matching_units(globs, self.unit_order)
+        if verbose:
+            for u in units:
+                head = (f"[array {len(u.nodes)}]" if u.kind == "array" else "[job]")
+                print(f"{head} {u.name}")
+                if u.kind == "array" and verbose > 1:
+                    for n in sorted(u.nodes, key=self._sortkey):
+                        print(f"    task {n.array_index}: {n.ident}")
+                afterok, aftercorr = self._dep_tokens(u, lambda x: x.name)
+                if afterok:
+                    print(f"    afterok:   {', '.join(afterok)}")
+                if aftercorr:
+                    print(f"    aftercorr: {', '.join(aftercorr)}")
+            return
+
+        def line(name, us, edges):
+            kind = "array" if us[0].kind == "array" else "job"
+            n = len(us[0].nodes)
+            scale = f"[{kind} {n}]" if kind == "array" else "[job]"
+            if len(us) > 1:
+                scale = f"[{len(us)}x {kind}" + (f" {n}]" if kind == "array" else "s]")
+            afterok, aftercorr = edges
+            dep = "  ".join(f"{glyph} {', '.join(ps)}"
+                            for glyph, ps in (("<-", afterok), ("<~", aftercorr)) if ps)
+            print(f"{name:34}{scale:16}{dep}".rstrip())
+
+        for key, us in self._by_recipe(units):
+            edges = {self._edge_recipes(u) for u in us}
+            if len(edges) == 1:
+                line(key, us, edges.pop())
+            else:                                 # siblings genuinely differ: don't average them
+                for u in us:
+                    line(u.name, [u], self._edge_recipes(u))
+        print("\n(<- afterok   <~ aftercorr)")
 
     # ---- materialize + invoke cc-submit for one unit ----
     @staticmethod
@@ -702,14 +819,34 @@ class Engine:
     @staticmethod
     def _fold_states(states):
         """One verdict for a set of task states: success only if all succeeded,
-        otherwise live beats terminal and the first failure names the outcome."""
+        otherwise live beats terminal -- naming the most advanced live state present
+        -- and with nothing live the first failure names the outcome."""
         if not states:
             return "UNKNOWN"
         if all(st == "COMPLETED" for st in states):
             return "COMPLETED"
-        if any(st in RUNNINGISH for st in states):
-            return "RUNNING"
-        return next(st for st in states if st != "COMPLETED")
+        live = next((st for st in LIVE_ORDER if st in states), None)
+        return live or next(st for st in states if st != "COMPLETED")
+
+    @staticmethod
+    def _expand_index(idx):
+        """The task indices an array-task id's index part stands for.
+
+        `7` is itself; slurm collapses every not-yet-started task of an array into a
+        single bracket expression (`[0-239]`, `[3,5,7-9]`, `[0-239%16]` when the array
+        is throttled). An index this does not recognize yields `[]`, so the caller can
+        keep the raw form and let it fall out of the numeric task table as before."""
+        if idx.isdigit():
+            return [idx]
+        if not (idx.startswith("[") and idx.endswith("]")):
+            return []
+        out = []
+        for part in idx[1:-1].partition("%")[0].split(","):
+            lo, _, hi = part.partition("-")
+            if not lo.isdigit() or (hi and not hi.isdigit()):
+                return []
+            out.extend(str(i) for i in range(int(lo), int(hi or lo) + 1))
+        return out
 
     def _parse_sacct(self, rows):
         """Fold sacct rows into one record per base job id, keeping per-task detail.
@@ -722,9 +859,10 @@ class Engine:
         across the whole array. Level two folds an array's tasks into the per-unit
         verdict, which is what `submit` reads and is unchanged.
 
-        A pending array appears as a range (`<base>_[5-239]`), so only a numeric
-        index becomes a task; a base id with no numeric index at all (an individual
-        job) gets no `tasks` key.
+        Tasks that have not started yet are reported as one range row
+        (`<base>_[5-239]`), which `_expand_index` splits back into a task apiece so
+        they are counted as themselves rather than inheriting the unit's verdict. A
+        base id with no numeric index at all (an individual job) gets no `tasks` key.
         """
         tasks = {}
         for r in rows:
@@ -740,7 +878,8 @@ class Engine:
         groups = defaultdict(dict)
         for stepless, t in tasks.items():
             base, _, idx = stepless.partition("_")
-            groups[base][idx] = t
+            for i in self._expand_index(idx) or [idx]:
+                groups[base][i] = dict(t)
         out = {}
         for base, per_task in groups.items():
             ts = list(per_task.values())
@@ -758,7 +897,7 @@ class Engine:
         states, and return {unit_name: latest_record}."""
         last = self._read_log(log_path)
         query = {n: rec for n, rec in last.items()
-                 if rec.get("state") in NON_TERMINAL and rec.get("job_id")}
+                 if is_live(rec.get("state")) and rec.get("job_id")}
         updates = {}
         if query:
             ids = sorted({str(rec["job_id"]) for rec in query.values()})
@@ -804,36 +943,79 @@ class Engine:
         Uses sacct's per-task table when the record carries one, and otherwise
         attributes the unit's own state to every node -- which is exactly what an
         individual job, a record written before per-task folding existed, and a
-        never-submitted unit all legitimately look like."""
-        st = (rec or {}).get("state", "absent")
+        never-submitted unit all legitimately look like.
+
+        INVALIDATED reports as ABSENT: both mean "no valid result here", and which
+        one it was is what `history` is for."""
+        st = (rec or {}).get("state") or "ABSENT"
+        st = "ABSENT" if st == "INVALIDATED" else st
         tasks = (rec or {}).get("tasks") or {}
         return {n: (tasks.get(str(n.array_index)) or {}).get("state", st)
                 for n in u.nodes}
 
+    @classmethod
+    def _hist(cls, counts, color=False):
+        return " · ".join(cls._paint(f"{counts[s]} {s}", state_class(s), color)
+                          for s in sorted(counts))
+
     @staticmethod
-    def _hist(counts):
-        return " · ".join(f"{counts[s]} {s}" for s in sorted(counts))
+    def _paint(text, cls_name, color):
+        return f"\033[{COLORS[cls_name]}m{text}\033[0m" if color else text
+
+    @classmethod
+    def _bar(cls, counts, color=False, width=BAR_WIDTH):
+        """A fixed-width stacked bar over the four state classes.
+
+        Every nonempty class gets at least one cell, taken off the largest class --
+        the point of the bar is that one bad task in seventy-two is visible."""
+        total = sum(counts.values())
+        if not total:
+            return ""
+        per = {}
+        for cls_name in CLASS_ORDER:
+            n = sum(v for st, v in counts.items() if state_class(st) == cls_name)
+            if n:
+                per[cls_name] = max(1, round(n * width / total))
+        while sum(per.values()) != width:                  # rounding slack rides on the largest
+            big = max(per, key=lambda k: per[k])
+            per[big] += 1 if sum(per.values()) < width else -1
+        return "".join(cls._paint((SOLID if color else GLYPH[c]) * per[c], c, color)
+                       for c in CLASS_ORDER if c in per)
 
     def status(self, sacct, workdir=".pipeline", verbose=False, globs=("*",),
                local=False):
-        """Per-unit state, rolled up by recipe. The histogram counts *tasks*, not
-        units, so a 3-task failure inside a 240-task array is visible; `verbose`
-        expands to one row per unit and names the tasks that did not complete.
+        """Per-recipe progress: elapsed, peak RSS, scale, a stacked bar and the task
+        histogram. `verbose` expands a recipe to one row per unit and names the tasks
+        that did not complete.
+
+        There is deliberately no single folded state column: no one label answers
+        "does this need me", "is it still going" and "is it finished" at once, and
+        every candidate rule buries one of them. The histogram answers all three.
 
         A unit is the display grain, so a glob matching any of an array's tasks
         keeps the whole array's row. `local` skips sacct entirely, for a pipeline
         that only ever ran through the synchronous runner."""
         log_path = pathlib.Path(workdir) / "run.jsonl"
         state = self._read_log(log_path) if local else self.reconcile(sacct, log_path)
-        print(f"{'unit':40} {'state':12} {'elapsed':10} maxrss")
+        color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        print(f"{'unit':36} {'elapsed':10} {'maxrss':7} {'scale':22} "
+              f"{'progress':{BAR_WIDTH}} tasks")
 
-        def row(name, rec, suffix=""):
-            if rec:
-                print(f"{name:40} {rec.get('state','?'):12} "
-                      f"{str(rec.get('elapsed','-')):10} "
-                      f"{self._fmt_rss(rec.get('max_rss'))}{suffix}")
-            else:
-                print(f"{name:40} {'absent':12}")
+        def row(name, us):
+            recs = [state.get(u.name) for u in us]
+            elapsed = max((r.get("elapsed") or "-" for r in recs if r),
+                          key=_seconds, default="-")
+            rss = max((r.get("max_rss") or 0 for r in recs if r), default=0)
+            c = counts(us)
+            ntasks = sum(len(u.nodes) for u in us)
+            scale = ""
+            if us[0].kind == "array" or len(us) > 1:
+                noun = "array" if us[0].kind == "array" else "job"
+                scale = f"[{len(us)} {noun}{'' if len(us) == 1 else 's'}"
+                scale += f", {ntasks} tasks]" if ntasks != len(us) else "]"
+            print(f"{name:36} {elapsed:10} {self._fmt_rss(rss):7} {scale:22} "
+                  f"{self._bar(c, color) if scale else ' ' * BAR_WIDTH} "
+                  f"{self._hist(c, color)}")
 
         def failures(u, rec):
             """Name the tasks whose own state is not COMPLETED. Silent when every
@@ -857,38 +1039,27 @@ class Engine:
                     c[st] += 1
             return c
 
-        # cluster units by originating recipe, preserving unit_order (position of
-        # each recipe's first unit); any recipe with >1 unit (array groups or an
-        # individual-job fan-out) rolls up to a single summary line unless --verbose.
+        for key, us in self._by_recipe(self._matching_units(globs, self.unit_order)):
+            if not verbose:
+                row(key, us)
+                continue
+            for u in us:
+                row(u.name, [u])
+                if state.get(u.name):
+                    failures(u, state.get(u.name))
+
+    @staticmethod
+    def _by_recipe(units):
+        """[(recipe, [unit, ...])] in unit order, so a recipe sits where its first
+        unit does. The display grain shared by `dag` and `status`."""
         groups, pos = [], {}
-        for u in self._matching_units(globs, self.unit_order):
+        for u in units:
             key = u.recipe or u.name
             if key not in pos:
                 pos[key] = len(groups)
                 groups.append((key, []))
             groups[pos[key]][1].append(u)
-
-        for key, us in groups:
-            if verbose:
-                for u in us:
-                    rec = state.get(u.name)
-                    row(u.name, rec)
-                    if rec:
-                        failures(u, rec)
-            elif len(us) == 1:
-                u, rec = us[0], state.get(us[0].name)
-                c = counts(us)
-                # A single unit already shows its own state; the histogram only adds
-                # something when its tasks disagree with each other.
-                row(u.name, rec, f"   {self._hist(c)}" if len(c) > 1 else "")
-            else:
-                ntasks = sum(len(u.nodes) for u in us)
-                noun = "arrays" if us[0].kind == "array" else "jobs"
-                # An individual-job fan-out has one node per unit, so a task count
-                # would just repeat the unit count.
-                scale = f"{len(us)} {noun}" + (f", {ntasks} tasks"
-                                               if ntasks != len(us) else "")
-                print(f"{key:40} [{scale}]  {self._hist(counts(us))}")
+        return groups
 
     def _matching_units(self, globs, units=None):
         return [u for u in (units if units is not None else self.units)
@@ -902,7 +1073,7 @@ class Engine:
         renamed or deleted is still cancellable -- which is the point of `cancel`."""
         last = self._read_log(pathlib.Path(workdir) / "run.jsonl")
         for name, rec in last.items():
-            if rec.get("state") not in NON_TERMINAL or not rec.get("job_id"):
+            if not is_live(rec.get("state")) or not rec.get("job_id"):
                 continue
             # A reconcile record carries no node list, so fall back to the unit name.
             idents = [name] + (rec.get("nodes") or [])
@@ -983,7 +1154,7 @@ class Engine:
     def invalidate(self, globs, workdir=".pipeline"):
         """Mark matching nodes stale so the next `submit` reruns them (and their
         downstream). Persistent across sessions; cleared naturally once a node
-        re-runs to COMPLETED. INVALIDATED is deliberately outside NON_TERMINAL, so
+        re-runs to COMPLETED. INVALIDATED is deliberately terminal, so
         reconcile won't query sacct for it and submit won't treat it as live."""
         self._force_state(globs, "INVALIDATED", "invalidated", workdir)
 
@@ -1009,13 +1180,25 @@ class Engine:
                     frontier.append(pu)
         return [u for u in self.unit_order if u in out]
 
+    def _children(self):
+        children = defaultdict(set)
+        for u in self.units:
+            for pu in self.uparents[u]:
+                children[pu].add(u)
+        return children
+
     # ---- submit: reconcile, then run only failed/absent (+ --rerun, downstream) ----
     def submit(self, cc, sacct="sacct", workdir=".pipeline", rerun=(), only=(),
-               local=False, dry=False, deps=False):
+               local=False, dry=False, deps=False, no_retry=False):
         """Reconcile, decide what to run, and submit it. With `dry`, take the same
         path but print the runner argv instead of invoking it, and log no submission
         (reconcile still records what sacct reported -- that is observed truth, and
-        `status` records it the same way)."""
+        `status` records it the same way).
+
+        `no_retry` runs only work that has never been attempted: anything the log
+        already has a record for -- a failure, a timeout, an INVALIDATED marker --
+        is left alone, and so is everything downstream of it, which would otherwise
+        submit against input its skipped parent never produced."""
         wd = pathlib.Path(workdir)
         wd.mkdir(parents=True, exist_ok=True)
         log_path = wd / "run.jsonl"
@@ -1024,8 +1207,11 @@ class Engine:
         # COMPLETED (incl. a stale SUBMITTED from an interrupted local run) reruns.
         state = self._read_log(log_path) if local else self.reconcile(sacct, log_path)
 
+        def eligible(st):
+            return st != "COMPLETED" if local else (not is_live(st) and st != "COMPLETED")
+
         def needs_run(st):
-            return st != "COMPLETED" if local else (st not in NON_TERMINAL and st != "COMPLETED")
+            return eligible(st) and (st is None if no_retry else True)
 
         scoped = bool(only) and set(only) != {"*"}
         if scoped:
@@ -1037,25 +1223,25 @@ class Engine:
 
         # `deps` is the upstream counterpart of downstream propagation: pull in what
         # the scope still needs. Unscoped it is a no-op -- the scope is everything.
+        # The walk uses `eligible`, not `needs_run`: a failed ancestor is still what
+        # the scope is waiting on, and under `no_retry` the blocked-set pass below is
+        # what then removes the scope unit.
         if scoped and deps:
-            scope |= set(self._unready_ancestors(scope, state, needs_run))
+            scope |= set(self._unready_ancestors(scope, state, eligible))
 
         forced = set(self._matching_units(rerun, scope))
         torun = {u for u in scope
                  if u in forced or needs_run((state.get(u.name) or {}).get("state"))}
 
         if not scoped:
-            children = defaultdict(set)               # downstream of a rerun is stale
-            for u in self.units:
-                for pu in self.uparents[u]:
-                    children[pu].add(u)
+            children = self._children()               # downstream of a rerun is stale
             frontier = list(torun)
             while frontier:
                 u = frontier.pop()
                 for c in children[u]:
                     cst = (state.get(c.name) or {}).get("state")
                     # cluster: don't disturb live jobs; local: nothing is live
-                    if c not in torun and (local or cst not in NON_TERMINAL):
+                    if c not in torun and (local or not is_live(cst)):
                         torun.add(c)
                         frontier.append(c)
         else:
@@ -1063,7 +1249,7 @@ class Engine:
             for u in torun:                           # a live parent is depended on via afterok
                 for pu in self.uparents[u]:
                     pst = (state.get(pu.name) or {}).get("state")
-                    live_ok = (not local) and pst in NON_TERMINAL
+                    live_ok = (not local) and is_live(pst)
                     if pst != "COMPLETED" and pu not in torun and not live_ok:
                         unmet.add(f"{u.name} needs {pu.name} ({pst or 'absent'})")
             if unmet and dry:
@@ -1080,6 +1266,33 @@ class Engine:
                 raise PipelineError("--only: unsatisfied dependencies (run them first, "
                                     "or pass --deps): " + "; ".join(sorted(unmet)))
 
+        # Two reasons to drop a unit from the wave, both of which make it an
+        # unsatisfied parent in turn -- so each propagates down its whole subtree,
+        # which would otherwise submit against input nobody is going to produce (the
+        # `keep` filter below drops the edge rather than holding the child back).
+        blocked, frontier, children = {}, [], self._children()
+        if no_retry:                                  # declined to retry a past attempt
+            for u in scope:
+                st = (state.get(u.name) or {}).get("state")
+                if u not in forced and eligible(st) and not needs_run(st):
+                    frontier.append((u, f"blocked by {u.name} {st or 'absent'}"))
+        for u in self.unit_order:                     # afterok parent that can no longer succeed
+            if u not in torun:
+                continue
+            doomed = [(pu, n) for pu, n in self._doomed_afterok(u, state) if pu not in torun]
+            if doomed:
+                pu, nbad = doomed[0]
+                blocked[u] = (f"afterok parent {pu.name} has {nbad} failed "
+                              f"task{'' if nbad == 1 else 's'}")
+                frontier.append((u, f"blocked by {u.name}, not submitted"))
+        while frontier:
+            u, reason = frontier.pop()
+            for c in children[u]:
+                if c in torun and c not in blocked:
+                    blocked[c] = reason
+                    frontier.append((c, reason))
+        torun -= set(blocked)
+
         for u in self.units:                          # skipped units keep their logged id
             if u not in torun:
                 u.job_id = (state.get(u.name) or {}).get("job_id")
@@ -1090,7 +1303,7 @@ class Engine:
         # may have aged out of the controller, so targeting it errors ("Job
         # dependency problem"); drop those edges.
         live = {u for u in self.units
-                if (state.get(u.name) or {}).get("state") in NON_TERMINAL}
+                if is_live((state.get(u.name) or {}).get("state"))}
         keep = torun | live
 
         def record(u, jid, st):
@@ -1108,8 +1321,8 @@ class Engine:
             for u in self.unit_order:
                 if u not in torun:
                     if u in scope:
-                        st = (state.get(u.name) or {}).get("state", "absent")
-                        print(f"skip   {u.name}\t({st})")
+                        why = blocked.get(u) or (state.get(u.name) or {}).get("state", "absent")
+                        print(f"skip   {u.name}\t({why})")
                     continue
                 if dry:
                     print(" ".join(self._runner_argv(cc, u, wd, dry_uid, keep)))
@@ -1162,9 +1375,13 @@ def main():
                          "already COMPLETED or live (no-op without --only)")
     ap.add_argument("--dry", action="store_true",
                     help="submit: decide identically, but print the runner argv and log nothing")
+    ap.add_argument("--no-retry", action="store_true",
+                    help="submit: run only what has never been attempted -- skip anything "
+                         "the log already records (failed, timed out, invalidated), and "
+                         "everything downstream of it. --rerun still forces")
     ap.add_argument("--workdir", default=".pipeline",
                     help="state directory: run.jsonl + materialized scripts")
-    ap.add_argument("-v", "--verbose", action="store_true",
+    ap.add_argument("-v", "--verbose", action="count", default=0,
                     help="status: expand grouped array recipes to per-group rows; "
                          "dag: list each array's tasks")
     args = ap.parse_args()
@@ -1192,7 +1409,8 @@ def main():
             eng.log_ids(args.globs or ["*"], workdir=wd)
         else:
             eng.submit(cc=args.cc_submit, sacct=args.sacct, workdir=wd, rerun=args.rerun,
-                       only=args.only, local=args.local, dry=args.dry, deps=args.deps)
+                       only=args.only, local=args.local, dry=args.dry, deps=args.deps,
+                       no_retry=args.no_retry)
     except PipelineError as e:
         sys.exit(f"pipeline: error: {e}")
     except BrokenPipeError:

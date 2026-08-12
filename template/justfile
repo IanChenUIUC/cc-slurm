@@ -12,6 +12,8 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 #   just force=1 only=1 run 'testing-*' # the job flaked: redo these alone and leave
 #                                       #   downstream results in place
 #   just deps=1    run 'testing-*'      # these, plus whatever upstream they still need
+#   just retry=0   run                  # only what has never been attempted: leave every
+#                                       #   past failure, and its downstream, alone
 #   just verbose=1 status               # expand rolled-up recipes and name failed tasks
 #   just spec=other.toml dag            # any variable below can be overridden this way
 #
@@ -22,6 +24,7 @@ local   := ""
 force   := ""
 only    := ""
 deps    := ""
+retry   := "1"
 dry     := ""
 verbose := ""
 
@@ -39,8 +42,24 @@ slurmlog   := "/scratch/ianchen3/slurm"
 runner  := if local == "" { "--cc-submit '" + cc_submit + "' --sacct '" + sacct + "'" } \
            else { "--cc-submit '" + cc_local + "' --local" }
 
-default:
-    @just --list
+# The flags are variables, not recipes, so `just --list` cannot show them; a bare
+# `just` prints them instead.
+
+# Print the behaviour flags (bare `just` does this).
+default: help
+
+# Print the behaviour flags, which go BEFORE the verb.
+help:
+    @echo 'flags (go BEFORE the verb):'
+    @echo '  local=1    run here, synchronously, no SLURM'
+    @echo '  force=1    redo these and everything downstream'
+    @echo '  only=1     with force: these alone'
+    @echo '  deps=1     also run whatever upstream they need'
+    @echo '  dry=1      print the decisions instead of issuing them'
+    @echo '  retry=0    skip anything already attempted and failed'
+    @echo '  verbose=1  expand rolled-up rows to per-unit ones'
+    @echo
+    @echo 'verbs: just --list'
 
 # ---- inspection: no cluster, no side effects -------------------------------
 
@@ -78,6 +97,7 @@ history glob='*':
 run glob='*':
     python3 pipeline.py submit {{spec}} --workdir '{{workdir}}' {{runner}} \
         {{ if dry == '' { '' } else { '--dry' } }} {{ if deps == '' { '' } else { '--deps' } }} \
+        {{ if retry == '0' { '--no-retry' } else { '' } }} \
         {{ if force == '' { "--only '" + glob + "'" } \
            else { if only == '' { "--rerun '" + glob + "'" } \
                   else { "--only '" + glob + "' --rerun '" + glob + "'" } } }}

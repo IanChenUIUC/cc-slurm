@@ -454,7 +454,10 @@ The append-only JSONL log is the project's memory; `sacct` is SLURM's. Both
 (re)submitted in the same run (fresh job id) or still live (id still known to the
 controller); a skipped `COMPLETED` parent is **not** targeted — its output
 already exists and its old job id may have aged out of `slurmctld`, which would
-otherwise make SLURM reject the submission ("Job dependency problem").
+otherwise make SLURM reject the submission ("Job dependency problem"). Every emitted
+dependency also carries `--kill-on-invalid-dep=yes`, so a job whose dependency becomes
+unsatisfiable is killed rather than sitting `PENDING` forever as
+`DependencyNeverSatisfied`.
 - **`--only <glob>`** restricts the run to matching nodes only — no downstream,
   no unrelated branches. It does **not** run their upstream; instead it requires
   each matched node's parents to be already `COMPLETED`, still live (a running
@@ -468,6 +471,19 @@ otherwise make SLURM reject the submission ("Job dependency problem").
   is not re-run merely for being upstream. Downstream propagation stays suppressed,
   and `--rerun` still forces only what its own glob matches. Without `--only` it is
   a no-op, the scope being everything already.
+- **`--no-retry`** runs only work that has **never been attempted**: any node the log
+  already has a record for — failed, timed out, cancelled, `INVALIDATED` — is skipped,
+  and so is everything downstream of it, transitively. Skipping a failure without
+  skipping its subtree would submit children whose input was never produced, since the
+  edge to a skipped parent is dropped (below). Each skip names its reason
+  (`skip  <unit>  (blocked by <root> FAILED)`). `--rerun` still forces what its glob
+  matches, so `--rerun` + `--no-retry` is "retry exactly this and nothing else".
+- **A doomed `afterok` edge is not submitted.** `afterok` is satisfied only when
+  *every* task of the parent succeeds, so a parent that is still live but already has
+  failed tasks can never satisfy it — SLURM would kill the child, which then reads as
+  the child's own failure. Those children are skipped (with their subtree) and told
+  why. `aftercorr` is per-task and therefore exempt: task *i* waits on parent task
+  *i*, and the healthy tasks proceed.
 - **`--rerun <glob>`** (transient) force-resubmits nodes whose identity matches,
   in this invocation only.
 - **`invalidate <glob>`** (persistent) appends an `INVALIDATED` record for
@@ -514,8 +530,8 @@ indices is the natural next step now that the state exists.)
   with no records prints `(no history)`, which distinguishes *never submitted* from
   *submitted and failed* — `status` reports both as `absent`.
 
-**Subcommands:** `dag [<glob>]` (`-v`), `submit` (`--only`/`--rerun <glob>`, `--local`,
-`--deps`, `--dry`), `status [<glob>]` (`-v`, `--local`), `history [<glob>]`, `invalidate <glob>`,
+**Subcommands:** `dag [<glob>]` (`-v`, `-vv`), `submit` (`--only`/`--rerun <glob>`, `--local`,
+`--deps`, `--dry`, `--no-retry`), `status [<glob>]` (`-v`, `--local`), `history [<glob>]`, `invalidate <glob>`,
 `complete <glob>`, `cancel-ids [<glob>]`, `log-ids [<glob>]`. All accept `--workdir` (default
 `.pipeline`). Every glob matches **node identities**; `cancel-ids` additionally
 matches unit names in the log, so a live job whose recipe was since renamed or
@@ -530,7 +546,7 @@ precede the recipe name):
 | you want to… | run |
 |---|---|
 | see what the spec expanded into | `just dag` |
-| …with every array task listed | `just verbose=1 dag` |
+| …with each recipe's units, then their tasks | `just verbose=1 dag`, `just dag -vv` |
 | see what a run would do, before doing it — or, if the subset isn't ready, what it is still waiting on | `just dry=1 run 'testing-*'` |
 | run whatever still needs running | `just run` |
 | run one subset, upstream already done | `just run 'testing-*'` |
@@ -538,20 +554,47 @@ precede the recipe name):
 | run it here, synchronously, no SLURM | `just local=1 run 'testing-*'` |
 | redo it: the inputs or the code changed | `just force=1 run 'testing-*'` |
 | redo it: the job flaked, downstream is fine | `just force=1 only=1 run 'testing-*'` |
+| move the frontier forward, leave every past failure alone | `just retry=0 run` |
 | mark it stale, but don't run it now | `just invalidate 'testing-*'` |
 | tell the DAG about work you did by hand | `just complete 'testing-*'` |
 | stop live jobs | `just cancel 'testing-*'` |
 | read the output | `just status`, `just logs 'testing-*'` |
 | read it back after a local run, with no cluster | `just local=1 status` |
 | find out which tasks of an array failed | `just verbose=1 status 'testing-*'` |
+| remind yourself what the flags are | `just` (or `just help`) |
 | see earlier attempts, not just the latest | `just history 'testing-*'` |
 
-**`status` roll-up.** Any recipe that expands to **more than one unit** — an
-`array_axes` split *or* an individual-job fan-out — prints as **one** summary line,
-`recipe  [N arrays, M tasks]  n COMPLETED · n FAILED · …`, so the listing stays
-compact. The histogram counts **tasks**, not units, so three failed tasks inside a
-240-task array are visible rather than reading as one failed array; the task count is
-omitted for an individual-job fan-out, where it would just repeat the unit count.
+**`status` roll-up.** One row per **recipe**, however many units it expands to:
+
+```
+unit                            elapsed   maxrss  scale                   progress              tasks
+build                           -         -                                                     COMPLETED
+csr-format                      00:28:04  89G     [1 array, 9 tasks]      ████████████████████  9 COMPLETED
+testing-csk                     01:04:02  9G      [7 arrays, 420 tasks]   ██████▒░░░░░░░░░░░░░  131 COMPLETED · 259 PENDING · 30 RUNNING
+strongscaling-steiner           00:12:41  64G     [8 arrays, 72 tasks]    ███████████████████▓  71 COMPLETED · 1 TIMEOUT
+```
+
+There is deliberately **no folded state column**. No single label answers "does this
+need me", "is it still going" and "is it finished" at once: live-beats-terminal hides
+a `2 FAILED · 12 RUNNING` array, and worst-wins renders a mostly-running array as
+`PENDING`. The histogram answers all three, so it is always printed — including when
+every task agrees, which is what distinguishes a 9-task array from a single job.
+
+The histogram counts **tasks**, not units, so three failed tasks inside a 240-task
+array are visible rather than reading as one failed array; the task count is omitted
+for an individual-job fan-out, where it would just repeat the unit count. Elapsed and
+peak RSS on a rolled-up row are the **max** across the group — for a parallel array,
+the numbers that size the budget. A node with no record counts as `ABSENT`, and
+`INVALIDATED` reports as `ABSENT` too: both mean "no valid result here", and which it
+was is what `history` is for.
+
+The bar is 20 cells over four classes — completed `█`, running `▒`, waiting `░`,
+failed `▓` — so it survives a pipe, `NO_COLOR`, and a monochrome terminal. **When
+color is on, every class is a solid `█` and the hue alone carries the distinction**:
+a shade glyph blends with the background, which renders the same color code visibly
+dimmer than the identically-coded histogram text beside it. **Any nonempty class keeps at least one cell**, taken off the
+largest: one bad task in seventy-two is exactly what the bar exists to show. Color is
+emitted only when stdout is a TTY and `NO_COLOR` is unset.
 
 `status -v` expands to one row per unit and, beneath it, names the tasks whose own
 state is not `COMPLETED`:

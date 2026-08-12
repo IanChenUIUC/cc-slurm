@@ -160,6 +160,9 @@ def sbatch(
     dep = build_dependency(afterok=depends_on)
     if dep:
         opts.append(f"--dependency={dep}")
+        # An unsatisfiable dependency otherwise leaves the job PENDING forever as
+        # DependencyNeverSatisfied; kill it instead, so a dead branch is visible.
+        opts.append("--kill-on-invalid-dep=yes")
     if cpus_per_task:
         opts.append(f"--cpus-per-task={shlex.quote(str(cpus_per_task))}")
     if partition:
@@ -225,6 +228,9 @@ def array(
     dep = build_dependency(afterok=depends_on, aftercorr=aftercorr)
     if dep:
         opts.append(f"--dependency={dep}")
+        # An unsatisfiable dependency otherwise leaves the job PENDING forever as
+        # DependencyNeverSatisfied; kill it instead, so a dead branch is visible.
+        opts.append("--kill-on-invalid-dep=yes")
     if cpus_per_task:
         opts.append(f"--cpus-per-task={shlex.quote(str(cpus_per_task))}")
     if partition:

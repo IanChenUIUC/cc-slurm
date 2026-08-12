@@ -37,7 +37,7 @@ def idents(r, prefix):
 
 
 def test_bare_reference_reads_a_defaults_list(mock_run):
-    r = mock_run(LISTS, {}, "dag", "-v")
+    r = mock_run(LISTS, {}, "dag", "-vv")
     assert r.ok, r.stderr + (r.error or "")
     assert idents(r, "genquery") == ["genquery-citeseer", "genquery-cora"]
 
@@ -45,7 +45,7 @@ def test_bare_reference_reads_a_defaults_list(mock_run):
 def test_qualified_reference_reads_a_recipe_list(mock_run):
     """`rep = "genquery.reps"` is a static lookup of recipe.key in the TOML, not a
     DAG-time parent alias -- params fix node identity before deps are wired."""
-    r = mock_run(LISTS, {}, "dag", "-v")
+    r = mock_run(LISTS, {}, "dag", "-vv")
     assert r.ok, r.stderr + (r.error or "")
     # 2 datasets x 4 reps (0..3, inclusive) x 2 sizes
     assert len(idents(r, "consume")) == 16
@@ -56,7 +56,7 @@ def test_qualified_reference_reads_a_recipe_list(mock_run):
 def test_range_is_inclusive_and_keeps_string_identities(mock_run):
     """A range yields ints where a literal list of strings yielded str. Identities
     render via str() either way, so node names must be unaffected."""
-    r = mock_run(LISTS, {}, "dag", "-v")
+    r = mock_run(LISTS, {}, "dag", "-vv")
     ids = idents(r, "consume")
     assert sum(i.startswith("consume-cora-") for i in ids) == 8      # reps 0..3 x 2 sizes
     assert not any(i.endswith("-4") or "-4-" in i for i in ids)      # 4 is out of range

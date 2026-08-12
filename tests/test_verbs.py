@@ -47,17 +47,25 @@ def test_dag_glob_still_shows_edges_to_units_outside_it(mock_run):
 
 
 def test_dag_rolls_arrays_up_and_verbose_expands(mock_run):
-    """The unit headers and edges are the view; on a real spec the per-task lines
-    outnumber them ~50:1, so they are opt-in."""
+    """Three levels: recipes, then units, then tasks. On a real spec the per-unit
+    lines outnumber the recipes ~2.5:1 and the per-task lines ~50:1, so both are
+    opt-in and each level is a strict expansion of the one above."""
     rolled = mock_run(FANIN, {}, "dag")
     assert rolled.ok, rolled.stderr
-    assert "[array 6] down" in rolled.stdout
+    assert "[array 6]" in rolled.stdout and "down" in rolled.stdout
     assert "task" not in rolled.stdout
+    assert "afterok:" not in rolled.stdout          # edges are inline now
+    assert "<- side, up" in rolled.stdout
 
-    expanded = mock_run(FANIN, {}, "dag", "-v")
-    assert "task 0: down-a-0" in expanded.stdout
-    assert [ln for ln in expanded.stdout.splitlines()
-            if not ln.startswith("    task")] == rolled.stdout.splitlines()
+    units = mock_run(FANIN, {}, "dag", "-v")
+    assert "[array 6] down" in units.stdout
+    assert "    afterok:   side, up" in units.stdout
+    assert "task" not in units.stdout
+
+    tasks = mock_run(FANIN, {}, "dag", "-vv")
+    assert "task 0: down-a-0" in tasks.stdout
+    assert [ln for ln in tasks.stdout.splitlines()
+            if not ln.startswith("    task")] == units.stdout.splitlines()
 
 
 def test_status_glob_restricts_rows(mock_run):

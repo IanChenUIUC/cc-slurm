@@ -47,7 +47,11 @@ the template (`gen-template.sh` copies only the four runners).
 | §11 | `--deps`: pulls the whole upstream chain, stops at a COMPLETED or live ancestor, no downstream propagation, no-op without `--only` | ✅ | `test_only.py` |
 | §11 | `cancel-ids`: omits terminal, honors globs, still reaches units absent from the spec | ✅ | `test_verbs.py` |
 | §11 | `dag <glob>` restricts units but keeps edges to parents outside the glob | ✅ | `test_verbs.py` |
-| §11 | `dag` rolls arrays up; `-v` expands to tasks and is otherwise identical | ✅ | `test_verbs.py` |
+| §11 | `dag` rolls up by recipe with inline edges; `-v` expands to units, `-vv` to tasks, each a strict expansion | ✅ | `test_verbs.py` |
+| §11 | `--no-retry`: a past failure (and INVALIDATED) is not retried, its subtree is skipped with a reason, `--rerun` overrides, a clean DAG decides identically | ✅ | `test_noretry.py` |
+| §11 | a child of a live afterok parent that already has failed tasks is skipped (aftercorr exempt) | ✅ | `test_noretry.py` |
+| §11 | an unrecognized sacct state reads as live, so it is never resubmitted underneath a running job | ✅ | `test_noretry.py` |
+| §11 | `status` display: bar classes, a 1-in-N failure keeps a cell, ABSENT (incl. INVALIDATED) counted, color only on a TTY, elapsed compared as a duration | ✅ | `test_status_display.py` |
 | §11 | `status <glob>` restricts rows, keeps a whole array whose task matched; `--local` never consults sacct | ✅ | `test_verbs.py` |
 | §11 | `invalidate` / `complete` / `--rerun` / `log-ids` | TODO | — |
 | §7  | valueless slurm flag: `true` emits `-x`; a non-boolean is a hard error | ✅ | `test_verbs.py` |
