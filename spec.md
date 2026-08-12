@@ -435,8 +435,13 @@ The append-only JSONL log is the project's memory; `sacct` is SLURM's. Both
   identifies a job *step* of an array *task* (`<base>_<idx>.batch`): each task's
   state and `Elapsed` come from its own main row while its peak `MaxRSS` is the max
   over its own steps — slurm reports `MaxRSS` on `.batch`, not on the main row — and
-  the tasks then fold into one state per unit. Only `COMPLETED` is success; every
-  other terminal state is resubmit-eligible.
+  the tasks then fold into one state per unit. Tasks slurm has not started yet come
+  back as a single range row (`<base>_[0-239]`, `[3,5,7-9]`, `%n` when throttled),
+  which expands back into one task apiece. Only `COMPLETED` is success; every
+  other terminal state is resubmit-eligible. A unit with anything live reports the
+  **most advanced live state present** (`COMPLETING` > `RUNNING` > `RESIZING` >
+  `SUSPENDED` > `CONFIGURING` > `REQUEUED` > `PENDING`), so an array still waiting in
+  the queue reads `PENDING`; a failure names the unit only once nothing is live.
   The appended record carries the per-unit `state`/`elapsed`/`max_rss` **plus** a
   `tasks` table (`index -> {state, elapsed, max_rss}`) for arrays; an individual job
   has no task index and gets no table. A record whose observed fields are identical

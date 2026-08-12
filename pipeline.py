@@ -46,8 +46,11 @@ SLURM_FLAGS = {"cpus": "-c", "mem": "-m", "partition": "-p", "time": "-t"}
 SLURM_BOOL_FLAGS = {"exclusive": "-x"}
 # Job states. Only COMPLETED is success; everything else terminal is a failure
 # (and thus resubmit-eligible). NON_TERMINAL states are still live: skip them.
-RUNNINGISH = {"RUNNING", "PENDING", "REQUEUED", "SUSPENDED",
-              "COMPLETING", "CONFIGURING", "RESIZING"}
+# Live states, most advanced first: a unit's verdict is the furthest-along state any
+# of its tasks is actually in, so an all-pending array reads PENDING, not RUNNING.
+LIVE_ORDER = ("COMPLETING", "RUNNING", "RESIZING", "SUSPENDED", "CONFIGURING",
+              "REQUEUED", "PENDING")
+RUNNINGISH = set(LIVE_ORDER)
 NON_TERMINAL = RUNNINGISH | {"SUBMITTED", "UNKNOWN"}
 # The fields a reconcile record observes; if none of them moved, there is nothing
 # new to append to the log.
@@ -702,14 +705,34 @@ class Engine:
     @staticmethod
     def _fold_states(states):
         """One verdict for a set of task states: success only if all succeeded,
-        otherwise live beats terminal and the first failure names the outcome."""
+        otherwise live beats terminal -- naming the most advanced live state present
+        -- and with nothing live the first failure names the outcome."""
         if not states:
             return "UNKNOWN"
         if all(st == "COMPLETED" for st in states):
             return "COMPLETED"
-        if any(st in RUNNINGISH for st in states):
-            return "RUNNING"
-        return next(st for st in states if st != "COMPLETED")
+        live = next((st for st in LIVE_ORDER if st in states), None)
+        return live or next(st for st in states if st != "COMPLETED")
+
+    @staticmethod
+    def _expand_index(idx):
+        """The task indices an array-task id's index part stands for.
+
+        `7` is itself; slurm collapses every not-yet-started task of an array into a
+        single bracket expression (`[0-239]`, `[3,5,7-9]`, `[0-239%16]` when the array
+        is throttled). An index this does not recognize yields `[]`, so the caller can
+        keep the raw form and let it fall out of the numeric task table as before."""
+        if idx.isdigit():
+            return [idx]
+        if not (idx.startswith("[") and idx.endswith("]")):
+            return []
+        out = []
+        for part in idx[1:-1].partition("%")[0].split(","):
+            lo, _, hi = part.partition("-")
+            if not lo.isdigit() or (hi and not hi.isdigit()):
+                return []
+            out.extend(str(i) for i in range(int(lo), int(hi or lo) + 1))
+        return out
 
     def _parse_sacct(self, rows):
         """Fold sacct rows into one record per base job id, keeping per-task detail.
@@ -722,9 +745,10 @@ class Engine:
         across the whole array. Level two folds an array's tasks into the per-unit
         verdict, which is what `submit` reads and is unchanged.
 
-        A pending array appears as a range (`<base>_[5-239]`), so only a numeric
-        index becomes a task; a base id with no numeric index at all (an individual
-        job) gets no `tasks` key.
+        Tasks that have not started yet are reported as one range row
+        (`<base>_[5-239]`), which `_expand_index` splits back into a task apiece so
+        they are counted as themselves rather than inheriting the unit's verdict. A
+        base id with no numeric index at all (an individual job) gets no `tasks` key.
         """
         tasks = {}
         for r in rows:
@@ -740,7 +764,8 @@ class Engine:
         groups = defaultdict(dict)
         for stepless, t in tasks.items():
             base, _, idx = stepless.partition("_")
-            groups[base][idx] = t
+            for i in self._expand_index(idx) or [idx]:
+                groups[base][i] = dict(t)
         out = {}
         for base, per_task in groups.items():
             ts = list(per_task.values())

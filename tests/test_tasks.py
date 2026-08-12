@@ -85,13 +85,67 @@ def test_individual_job_gets_no_tasks_key(mock_run):
     assert "tasks" not in r.latest["solo"]
 
 
-def test_pending_array_range_row_is_not_a_task(mock_run):
-    """A pending array appears as `<base>_[5-9]`, which is not a task index. It must
-    still fold into the unit state without polluting the task table."""
+def test_pending_range_row_expands_into_tasks(mock_run):
+    """Slurm collapses the tasks it has not started into one `<base>_[1-5]` row. Each
+    stands for a task, so the table is complete and the pending ones count as
+    themselves instead of inheriting the unit's verdict."""
     seed = {"id": "700", "tasks": {"0": "COMPLETED", "[1-5]": "PENDING"}}
     r = mock_run(FANIN, {"down": seed}, "status")
-    assert r.latest["down"]["state"] == "RUNNING"       # pending is live
-    assert set(r.tasks("down")) == {"0"}
+    assert r.latest["down"]["state"] == "PENDING"       # the one live state present
+    assert r.tasks("down") == {"0": "COMPLETED", "1": "PENDING", "2": "PENDING",
+                               "3": "PENDING", "4": "PENDING", "5": "PENDING"}
+
+
+def test_all_pending_array_reports_pending(mock_run):
+    """The unit verdict is the most advanced live state actually present, so an array
+    that has not started reads PENDING -- it used to read RUNNING at 00:00:00."""
+    r = mock_run(FANIN, {"down": {"id": "700", "tasks": {"[0-5]": "PENDING"}}},
+                 "status")
+    assert r.ok, r.stderr
+    assert r.latest["down"]["state"] == "PENDING"
+    assert set(r.tasks("down").values()) == {"PENDING"}
+
+
+def test_pending_array_is_still_live_for_submit(mock_run):
+    # PENDING is NON_TERMINAL exactly as RUNNING was: submit must leave it alone.
+    r = mock_run(FANIN, {"down": {"id": "700", "tasks": {"[0-5]": "PENDING"}}},
+                 "submit", "--only", "down*")
+    assert r.ok, r.stderr
+    assert ("down", "PENDING") in r.skipped
+    assert "down" not in r.submitted
+
+
+def test_status_histogram_counts_pending_tasks(mock_run):
+    seed = {"id": "700", "tasks": {"0": "RUNNING", "[1-5]": "PENDING"}}
+    r = mock_run(FANIN, {"down": seed}, "status")
+    line = next(ln for ln in r.stdout.splitlines() if ln.startswith("down "))
+    assert "RUNNING" in line.split()[1]
+    assert "5 PENDING · 1 RUNNING" in line
+
+
+def test_expand_index_forms(engine):
+    """Every index shape sacct emits, plus the degradation path: an unrecognized
+    form yields nothing, so the caller keeps the raw index as before."""
+    ex = engine.Engine({})._expand_index
+    assert ex("7") == ["7"]
+    assert ex("[0-3]") == ["0", "1", "2", "3"]
+    assert ex("[0-239%16]") == [str(i) for i in range(240)]      # throttle suffix
+    assert ex("[3,5,7-9]") == ["3", "5", "7", "8", "9"]
+    assert ex("") == [] and ex("[abc]") == [] and ex("x") == []
+
+
+def test_range_row_expands_alongside_real_sacct_rows(engine):
+    """White-box against the captured cluster rows with a pending range appended: the
+    expanded tasks carry the range's state and no RSS, and the unit's own
+    state/elapsed/max_rss still come from the tasks that ran."""
+    rows = [ln.split("|") for ln in SAMPLE.read_text().splitlines() if ln.strip()]
+    rows.append("9789233_[10-12]|PENDING|0:0|00:00:00|".split("|"))
+    rec = engine.Engine({})._parse_sacct(rows)["9789233"]
+    assert set(rec["tasks"]) == {"0", "5", "8", "9", "10", "11", "12"}
+    assert rec["tasks"]["11"] == {"state": "PENDING", "elapsed": "00:00:00",
+                                  "max_rss": 0}
+    assert rec["state"] == "PENDING"            # the only live state present
+    assert rec["max_rss"] == 5259164 * KB       # unchanged by the pending tasks
 
 
 def test_unchanged_observation_is_not_appended(mock_run):

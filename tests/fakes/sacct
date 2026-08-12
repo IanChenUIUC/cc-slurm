@@ -21,6 +21,9 @@ Row shape mirrors slurm's: each task emits its own main row `<id>_<idx>` with an
 **empty** MaxRSS plus a `<id>_<idx>.batch` step row carrying MaxRSS. That split is
 the thing the engine's two-level fold exists to handle, so the fake has to reproduce
 it rather than flattening it.
+
+A bracket index (`{"tasks": {"[34-39]": "PENDING"}}`) stands for the tasks slurm has
+not started: one main row, no step rows, since a task that never ran has no steps.
 """
 import json
 import os
@@ -50,6 +53,8 @@ def emit(jid, info):
         elapsed = t.get("elapsed", info.get("elapsed", "00:00:30"))
         maxrss = t.get("maxrss", info.get("maxrss", "100M"))
         row(f"{jid}_{idx}", t["state"], elapsed, "")       # main row: no MaxRSS
+        if not str(idx).isdigit():
+            continue
         row(f"{jid}_{idx}.batch", t["state"], elapsed, maxrss)
         row(f"{jid}_{idx}.extern", t["state"], elapsed, "")
 
