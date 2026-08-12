@@ -316,6 +316,25 @@ class Engine:
                         f"{n.ident}: alias cycle among {sorted(pending)}")
 
     # ---- Sec.9 step 7: resolve slurm flags and command ----
+    @staticmethod
+    def _slurm_map(key, table, node):
+        """One slurm value written as a per-param mapping (Sec.5): pick the entry
+        matching this node's binding for `param`. The axis is named explicitly --
+        a bare value key could match any binding, so inference would be ambiguous."""
+        table = dict(table)
+        param = table.pop("param", None)
+        default = table.pop("default", None)
+        if param is None:
+            raise PipelineError(f"{node.ident}: slurm.{key} mapping has no 'param' key")
+        if param not in node.binding:
+            raise PipelineError(f"{node.ident}: slurm.{key} maps on {param!r}, which is "
+                                f"not a param of this recipe (has: {sorted(node.binding)})")
+        val = table.get(str(node.binding[param]), default)
+        if val is None:
+            raise PipelineError(f"{node.ident}: slurm.{key} has no entry for "
+                                f"{param}={node.binding[param]!r} and no 'default'")
+        return val
+
     def _resolve_slurm_command(self):
         for n in self.order:
             merged = {**self.default_slurm, **n.rdef.get("slurm", {}), **n.slurm_override}
@@ -324,6 +343,10 @@ class Engine:
                 if k not in allowed:
                     raise PipelineError(f"{n.ident}: unknown slurm key {k!r} "
                                         f"(allowed: {sorted(allowed)})")
+            # Resolve mappings first, so the closed flag set and the bool-flag
+            # validation below see a plain value either way.
+            merged = {k: self._slurm_map(k, v, n) if isinstance(v, dict) else v
+                      for k, v in merged.items()}
             n.slurm = {k: self._subst(str(v), n, n.aliases) for k, v in merged.items()}
             for k in SLURM_BOOL_FLAGS:                # validate here: the node names the error
                 if k in n.slurm:
@@ -579,13 +602,15 @@ class Engine:
         return f"cc-submit array {script} -j {u.name} {flags} {deps}".rstrip()
 
     # ---- subcommands ----
-    def dag(self, globs=("*",)):
+    def dag(self, globs=("*",), verbose=False):
         # Dependency tokens still name parents outside the glob -- that is the edge
-        # you most want to see when inspecting a subset.
+        # you most want to see when inspecting a subset. Array tasks are listed only
+        # under `verbose`: a real spec has thousands of them, which buries the unit
+        # headers and edges that are the point of the view.
         for u in self._matching_units(globs, self.unit_order):
             head = (f"[array {len(u.nodes)}]" if u.kind == "array" else "[job]")
             print(f"{head} {u.name}")
-            if u.kind == "array":
+            if u.kind == "array" and verbose:
                 for n in sorted(u.nodes, key=self._sortkey):
                     print(f"    task {n.array_index}: {n.ident}")
             afterok, aftercorr = self._dep_tokens(u, lambda x: x.name)
@@ -789,11 +814,17 @@ class Engine:
     def _hist(counts):
         return " · ".join(f"{counts[s]} {s}" for s in sorted(counts))
 
-    def status(self, sacct, workdir=".pipeline", verbose=False):
+    def status(self, sacct, workdir=".pipeline", verbose=False, globs=("*",),
+               local=False):
         """Per-unit state, rolled up by recipe. The histogram counts *tasks*, not
         units, so a 3-task failure inside a 240-task array is visible; `verbose`
-        expands to one row per unit and names the tasks that did not complete."""
-        state = self.reconcile(sacct, pathlib.Path(workdir) / "run.jsonl")
+        expands to one row per unit and names the tasks that did not complete.
+
+        A unit is the display grain, so a glob matching any of an array's tasks
+        keeps the whole array's row. `local` skips sacct entirely, for a pipeline
+        that only ever ran through the synchronous runner."""
+        log_path = pathlib.Path(workdir) / "run.jsonl"
+        state = self._read_log(log_path) if local else self.reconcile(sacct, log_path)
         print(f"{'unit':40} {'state':12} {'elapsed':10} maxrss")
 
         def row(name, rec, suffix=""):
@@ -830,7 +861,7 @@ class Engine:
         # each recipe's first unit); any recipe with >1 unit (array groups or an
         # individual-job fan-out) rolls up to a single summary line unless --verbose.
         groups, pos = [], {}
-        for u in self.unit_order:
+        for u in self._matching_units(globs, self.unit_order):
             key = u.recipe or u.name
             if key not in pos:
                 pos[key] = len(groups)
@@ -963,9 +994,24 @@ class Engine:
         `invalidate`/`--rerun` overrides this normally."""
         self._force_state(globs, "COMPLETED", "completed", workdir)
 
+    def _unready_ancestors(self, units, state, needs_run):
+        """Units upstream of `units` that would have to run first, in topo order so
+        the list reads as a run order. The walk stops at a parent that is COMPLETED
+        or still live -- either is already satisfiable as a dependency, so nothing
+        above it matters."""
+        out, frontier = set(), list(units)
+        while frontier:
+            for pu in self.uparents[frontier.pop()]:
+                if pu in out or pu in units:
+                    continue
+                if needs_run((state.get(pu.name) or {}).get("state")):
+                    out.add(pu)
+                    frontier.append(pu)
+        return [u for u in self.unit_order if u in out]
+
     # ---- submit: reconcile, then run only failed/absent (+ --rerun, downstream) ----
     def submit(self, cc, sacct="sacct", workdir=".pipeline", rerun=(), only=(),
-               local=False, dry=False):
+               local=False, dry=False, deps=False):
         """Reconcile, decide what to run, and submit it. With `dry`, take the same
         path but print the runner argv instead of invoking it, and log no submission
         (reconcile still records what sacct reported -- that is observed truth, and
@@ -988,6 +1034,11 @@ class Engine:
                 raise PipelineError(f"--only matched no nodes: {list(only)}")
         else:
             scope = set(self.units)
+
+        # `deps` is the upstream counterpart of downstream propagation: pull in what
+        # the scope still needs. Unscoped it is a no-op -- the scope is everything.
+        if scoped and deps:
+            scope |= set(self._unready_ancestors(scope, state, needs_run))
 
         forced = set(self._matching_units(rerun, scope))
         torun = {u for u in scope
@@ -1015,9 +1066,19 @@ class Engine:
                     live_ok = (not local) and pst in NON_TERMINAL
                     if pst != "COMPLETED" and pu not in torun and not live_ok:
                         unmet.add(f"{u.name} needs {pu.name} ({pst or 'absent'})")
+            if unmet and dry:
+                # An inspection verb should answer the question, not refuse it. The
+                # wave itself is deliberately not printed: those units' edges would be
+                # dropped by `keep` below, so the argv would not be what a real run
+                # issues once the prerequisites exist.
+                print("# would need first (topo order, add deps to run them):")
+                for u in self._unready_ancestors(scope, state, needs_run):
+                    st = (state.get(u.name) or {}).get("state", "absent")
+                    print(f"#   {u.name}\t({st})")
+                return
             if unmet:
-                raise PipelineError("--only: unsatisfied dependencies (run them first): "
-                                    + "; ".join(sorted(unmet)))
+                raise PipelineError("--only: unsatisfied dependencies (run them first, "
+                                    "or pass --deps): " + "; ".join(sorted(unmet)))
 
         for u in self.units:                          # skipped units keep their logged id
             if u not in torun:
@@ -1084,7 +1145,8 @@ def main():
                                        "log-ids"])
     ap.add_argument("spec")
     ap.add_argument("globs", nargs="*",
-                    help="node-identity globs (for invalidate / complete / log-ids)")
+                    help="node-identity globs (dag / status / history / invalidate / "
+                         "complete / cancel-ids / log-ids)")
     ap.add_argument("--cc-submit", default="cc-submit")
     ap.add_argument("--sacct", default="sacct")
     ap.add_argument("--rerun", action="append", default=[],
@@ -1093,13 +1155,18 @@ def main():
                     help="restrict the run to nodes matching this glob (repeatable); "
                          "errors if a matched node's upstream isn't COMPLETED, live, or in the run")
     ap.add_argument("--local", action="store_true",
-                    help="synchronous runner: log terminal state from its exit; skip sacct")
+                    help="submit: synchronous runner, log terminal state from its exit; "
+                         "status: read the log. Either way, skip sacct")
+    ap.add_argument("--deps", action="store_true",
+                    help="with --only: also run the scope's upstream, wherever it isn't "
+                         "already COMPLETED or live (no-op without --only)")
     ap.add_argument("--dry", action="store_true",
                     help="submit: decide identically, but print the runner argv and log nothing")
     ap.add_argument("--workdir", default=".pipeline",
                     help="state directory: run.jsonl + materialized scripts")
     ap.add_argument("-v", "--verbose", action="store_true",
-                    help="status: expand grouped array recipes to per-group rows")
+                    help="status: expand grouped array recipes to per-group rows; "
+                         "dag: list each array's tasks")
     args = ap.parse_args()
     try:
         try:
@@ -1109,9 +1176,10 @@ def main():
         eng = Engine(spec, specdir=pathlib.Path(args.spec).parent)
         wd = args.workdir
         if args.action == "dag":
-            eng.dag(args.globs or ["*"])
+            eng.dag(args.globs or ["*"], verbose=args.verbose)
         elif args.action == "status":
-            eng.status(sacct=args.sacct, workdir=wd, verbose=args.verbose)
+            eng.status(sacct=args.sacct, workdir=wd, verbose=args.verbose,
+                       globs=args.globs or ["*"], local=args.local)
         elif args.action == "history":
             eng.history(args.globs or ["*"], workdir=wd)
         elif args.action == "invalidate":
@@ -1124,7 +1192,7 @@ def main():
             eng.log_ids(args.globs or ["*"], workdir=wd)
         else:
             eng.submit(cc=args.cc_submit, sacct=args.sacct, workdir=wd, rerun=args.rerun,
-                       only=args.only, local=args.local, dry=args.dry)
+                       only=args.only, local=args.local, dry=args.dry, deps=args.deps)
     except PipelineError as e:
         sys.exit(f"pipeline: error: {e}")
     except BrokenPipeError:

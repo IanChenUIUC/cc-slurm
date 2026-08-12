@@ -23,6 +23,27 @@ command = "echo down ${dataset} ${rep}"
 slurm   = { cpus = 1 }
 """
 
+# Three levels, so upstream expansion has something to be transitive *through*:
+# `leaf` <- `mid` <- `root`, mirroring testing-steiner <- testing-core-decomp <- csr-format.
+CHAIN = """
+[recipe.root]
+array   = true
+params  = { dataset = ["a"] }
+command = "echo root ${dataset}"
+
+[recipe.mid]
+array   = true
+deps    = ["root(dataset=${dataset})"]
+params  = { dataset = ["a"] }
+command = "echo mid ${dataset}"
+
+[recipe.leaf]
+array   = true
+deps    = ["mid(dataset=${dataset})"]
+params  = { dataset = ["a"] }
+command = "echo leaf ${dataset}"
+"""
+
 # One recipe split into several arrays by `array_axes`, mirroring `testing-csk`
 # (7 arrays of 60). Here: 2 arrays of 3, so `status` rolls the recipe up and the
 # task histogram has to count across units rather than within one.

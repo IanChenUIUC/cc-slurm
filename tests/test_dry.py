@@ -2,7 +2,7 @@
 of issued. `dry` used to be a separate walk that listed every unit unconditionally,
 never reconciling and never computing what actually needed to run.
 """
-from specs import FANIN
+from specs import CHAIN, FANIN
 
 UP, SIDE = "700", "800"
 
@@ -49,11 +49,21 @@ def test_dry_renders_in_wave_parents_as_placeholders(mock_run):
     assert r.planned["up"].afterok == []
 
 
-def test_dry_enforces_only_dependencies(mock_run):
-    """A dry run is not a way to bypass the --only precondition."""
+def test_dry_reports_unmet_prerequisites_instead_of_erroring(mock_run):
+    """An inspection verb should answer the question. A real submit still refuses
+    (test_only.py) -- what dry does instead is name what would have to run first."""
     r = mock_run(FANIN, {"side": ("COMPLETED", SIDE)}, "submit", "--dry", "--only", "down*")
-    assert not r.ok
-    assert "down needs up (absent)" in (r.error or "")
+    assert r.ok, r.stderr + (r.error or "")
+    assert "would need first" in r.stdout
+    assert "up" in r.stdout and "(absent)" in r.stdout
+    assert not r.planned          # the wave itself is not printed: its edges would lie
+
+
+def test_dry_reports_the_whole_chain_not_just_immediate_parents(mock_run):
+    r = mock_run(CHAIN, {}, "submit", "--dry", "--only", "leaf*")
+    assert r.ok, r.stderr + (r.error or "")
+    named = [ln for ln in r.stdout.splitlines() if ln.startswith("#   ")]
+    assert [ln.split()[1] for ln in named] == ["root", "mid"]   # topo order = run order
 
 
 def test_dry_honors_rerun(mock_run):

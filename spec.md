@@ -233,6 +233,26 @@ resolve with three-level precedence, per flag, highest wins:
 | `time`      | `-t`           |                                |
 
 - Values are interpolated (§4): `cpus = "${threads}"` is valid.
+- A value may instead be a **per-param mapping**, for a resource that varies with
+  one axis. Interpolation can echo a param but not *map* it, and record-form
+  `params` would mean re-inlining the whole list on the recipe:
+
+  ```toml
+  params = { dataset = "all_networks" }
+  slurm  = { cpus = 16, mem = { param = "dataset", default = "128GB", twitter_social = "256GB" } }
+  ```
+
+  The axis is **named explicitly** (`param = "dataset"`): a bare value key could
+  match any binding, so inference would be ambiguous. The chosen entry is then
+  interpolated like any other value. It is an error (§10) for the mapping to omit
+  `param`, to name a param the recipe lacks, or to have neither an entry for a
+  node's value nor a `default`.
+- **A mapping keyed on a param an array sweeps makes that recipe ineligible**
+  (§9: resources must be uniform within an array). Either split on another param
+  with `array_axes`, or drop `array = true` and let the recipe fan out into
+  individual jobs — which keeps element-wise dependency edges to an aligned array
+  parent (`-d <id>_<idx>`), so the fan-out costs scheduling precision only in the
+  other direction, where an array *child* depends on the fan-out.
 - **All flags are optional**; a flag absent after defaults is simply not passed,
   and the node inherits the `#SBATCH` floor baked into the cluster wrapper
   scripts (`run.sbatch.sh` / `array.sbatch.sh`).
@@ -394,6 +414,8 @@ dependents can target specific elements (`<arrayid>_<idx>`).
 - A reserved word (`params`/`deps`/`command`/`command_file`/`interpreter`/`array`/
   `array_axes`/`slurm`) used as an alias.
 - An unknown `slurm.*` key.
+- A per-param `slurm` mapping with no `param` key, naming a param the recipe lacks,
+  or with neither a matching entry nor a `default`.
 - A `params` string naming no declared list, or naming something that is not a list.
 - A range whose end is below its start.
 - A recipe declaring both `command` and `command_file`, or a `command_file` that
@@ -434,6 +456,13 @@ otherwise make SLURM reject the submission ("Job dependency problem").
   parent is depended on via `afterok`), or themselves in the run, and errors
   (running nothing) otherwise. `--rerun`/skip-completed still apply
   within the scope, so `--only` composes with them.
+- **`--deps`** is the upstream counterpart of that downstream propagation: with
+  `--only`, the scope grows to include every ancestor that still needs to run,
+  transitively. The walk stops at an ancestor that is `COMPLETED` or live — either
+  is already satisfiable as a dependency, so nothing above it is pulled in, and it
+  is not re-run merely for being upstream. Downstream propagation stays suppressed,
+  and `--rerun` still forces only what its own glob matches. Without `--only` it is
+  a no-op, the scope being everything already.
 - **`--rerun <glob>`** (transient) force-resubmits nodes whose identity matches,
   in this invocation only.
 - **`invalidate <glob>`** (persistent) appends an `INVALIDATED` record for
@@ -465,6 +494,12 @@ indices is the natural next step now that the state exists.)
   (that is observed truth, and `status` records it identically), and a parent that
   is *in the same wave* has no job id yet, so its dependency renders as
   `<unit-name>` while live and skipped parents show their real ids.
+  Where a real `submit` **errors** on an `--only` scope with unmet upstream, `--dry`
+  instead prints what would have to run first — transitively, in topo order, so the
+  list reads as a run order — and exits successfully. An inspection verb should
+  answer the question rather than refuse it. It deliberately stops there instead of
+  also printing the wave: those units' dependency edges are dropped by the same
+  rule as a skipped parent's, so the argv would not be what a working run issues.
 
 - **`history [<glob>]`** reads the log without touching `sacct`: every record for
   each matching unit, in order, tagged `submit` / `reconcile` / `force`. `status`
@@ -474,8 +509,8 @@ indices is the natural next step now that the state exists.)
   with no records prints `(no history)`, which distinguishes *never submitted* from
   *submitted and failed* — `status` reports both as `absent`.
 
-**Subcommands:** `dag [<glob>]`, `submit` (`--only`/`--rerun <glob>`, `--local`,
-`--dry`), `status` (`-v`), `history [<glob>]`, `invalidate <glob>`,
+**Subcommands:** `dag [<glob>]` (`-v`), `submit` (`--only`/`--rerun <glob>`, `--local`,
+`--deps`, `--dry`), `status [<glob>]` (`-v`, `--local`), `history [<glob>]`, `invalidate <glob>`,
 `complete <glob>`, `cancel-ids [<glob>]`, `log-ids [<glob>]`. All accept `--workdir` (default
 `.pipeline`). Every glob matches **node identities**; `cancel-ids` additionally
 matches unit names in the log, so a live job whose recipe was since renamed or
@@ -483,16 +518,18 @@ deleted is still cancellable.
 
 ### Which one do I reach for?
 
-The `justfile` shipped with the template maps these to eight verbs, each taking an
+The `justfile` shipped with the template maps these to seven verbs, each taking an
 optional glob, with the behaviour flags as `just` variable overrides (which must
 precede the recipe name):
 
 | you want to… | run |
 |---|---|
 | see what the spec expanded into | `just dag` |
-| see what a run would do, before doing it | `just dry 'testing-*'` |
+| …with every array task listed | `just verbose=1 dag` |
+| see what a run would do, before doing it — or, if the subset isn't ready, what it is still waiting on | `just dry=1 run 'testing-*'` |
 | run whatever still needs running | `just run` |
 | run one subset, upstream already done | `just run 'testing-*'` |
+| run one subset **and whatever it needs** | `just deps=1 run 'testing-*'` |
 | run it here, synchronously, no SLURM | `just local=1 run 'testing-*'` |
 | redo it: the inputs or the code changed | `just force=1 run 'testing-*'` |
 | redo it: the job flaked, downstream is fine | `just force=1 only=1 run 'testing-*'` |
@@ -500,6 +537,7 @@ precede the recipe name):
 | tell the DAG about work you did by hand | `just complete 'testing-*'` |
 | stop live jobs | `just cancel 'testing-*'` |
 | read the output | `just status`, `just logs 'testing-*'` |
+| read it back after a local run, with no cluster | `just local=1 status` |
 | find out which tasks of an array failed | `just verbose=1 status 'testing-*'` |
 | see earlier attempts, not just the latest | `just history 'testing-*'` |
 
@@ -538,7 +576,7 @@ to the unit-level line rather than failing.
 | `array`           | recipe                        | no (bool)    | opt into single-array submission (§9)            |
 | `array_axes`      | recipe                        | no (list)    | params that sweep within each array; others split it into multiple arrays (§9) |
 | `max_array_size`  | defaults                      | no (int)     | per-array task cap, default 1000; build-time guard (§9) |
-| `slurm.*`         | defaults / recipe / record    | yes          | `cc-submit` flags (`cpus`,`mem`,`partition`,`time`) |
+| `slurm.*`         | defaults / recipe / record    | yes          | `cc-submit` flags (`cpus`,`mem`,`partition`,`time`); a value may be a per-param mapping (§7) |
 | *(other key)*     | defaults / recipe             | yes          | alias — readable as `${recipe.key}`              |
 
 ---

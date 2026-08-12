@@ -34,6 +34,7 @@ the template (`gen-template.sh` copies only the four runners).
 | §6  | captures wire; dashed recipe names | partial | `test_deps.py::test_dashed_recipe_captures_parse_and_wire` |
 | §6  | explicit-fan-in rule, zero-match, `${listvar}` splice | TODO | — |
 | §7  | slurm three-level precedence; unknown-key error | TODO | — |
+| §7  | per-param `slurm` mapping: value per node, other keys untouched, reaches the runner, ineligible on an array axis | ✅ | `test_slurm_map.py` |
 | §9  | multi-line array → one intact script per task | partial | `test_arrays.py::test_multiline_array_command_materializes_one_script_per_task` |
 | §9  | array eligibility errors, `array_axes` split, `max_array_size`, dep-translation table (`aftercorr` vs `afterok`) | TODO | — |
 | §11 | reconcile folds sacct; skip-COMPLETED; FAILED resubmit-eligible; live left untouched; rerun → downstream stale; completed-parent edge dropped | ✅ | `test_execution.py` |
@@ -42,9 +43,12 @@ the template (`gen-template.sh` copies only the four runners).
 | §11 | reconcile's two-level fold: per-task state/elapsed/RSS, unit verdict unchanged, RSS not smeared across tasks, no `tasks` key for an individual job, pending `_[a-b]` range is not a task, unchanged observation not re-appended | ✅ | `test_tasks.py` |
 | §11 | `history`: every attempt in order, event labels (incl. inferred for pre-`event` records), `(no history)` vs a failed attempt, glob restriction, task histogram | ✅ | `test_history.py` |
 | §11 | a partly-failed array is still resubmitted **whole** (per-task resubmission is not implemented) | ✅ | `test_tasks.py` |
-| §11 | `submit --dry`: submits nothing, logs no submission, still materializes; plans only what needs running; matches a real submit's units/deps/flags; in-wave parents as `<placeholders>`; honors `--only` preconditions and `--rerun` | ✅ | `test_dry.py` |
+| §11 | `submit --dry`: submits nothing, logs no submission, still materializes; plans only what needs running; matches a real submit's units/deps/flags; in-wave parents as `<placeholders>`; honors `--rerun`; reports unmet `--only` prerequisites (transitively, topo order) instead of erroring | ✅ | `test_dry.py` |
+| §11 | `--deps`: pulls the whole upstream chain, stops at a COMPLETED or live ancestor, no downstream propagation, no-op without `--only` | ✅ | `test_only.py` |
 | §11 | `cancel-ids`: omits terminal, honors globs, still reaches units absent from the spec | ✅ | `test_verbs.py` |
 | §11 | `dag <glob>` restricts units but keeps edges to parents outside the glob | ✅ | `test_verbs.py` |
+| §11 | `dag` rolls arrays up; `-v` expands to tasks and is otherwise identical | ✅ | `test_verbs.py` |
+| §11 | `status <glob>` restricts rows, keeps a whole array whose task matched; `--local` never consults sacct | ✅ | `test_verbs.py` |
 | §11 | `invalidate` / `complete` / `--rerun` / `log-ids` | TODO | — |
 | §7  | valueless slurm flag: `true` emits `-x`; a non-boolean is a hard error | ✅ | `test_verbs.py` |
 
@@ -61,6 +65,7 @@ the template (`gen-template.sh` copies only the four runners).
 | dependency cycle / alias cycle | TODO | — |
 | reserved word used as alias | TODO | — |
 | unknown `slurm.*` key | TODO | — |
+| slurm mapping: no `param`, unknown `param`, no entry and no `default` | ✅ | `test_slurm_map.py` |
 | `array = true` on ineligible recipe | TODO | — |
 | `params` string naming no declared list / a non-list | ✅ | `test_lists.py` |
 | range with end below start | ✅ | `test_lists.py` |

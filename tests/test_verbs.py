@@ -1,7 +1,7 @@
 """spec.md §11 read-only / state verbs: `cancel-ids`, `dag` globbing, and the
 strict validation of the valueless slurm flags.
 """
-from specs import FANIN
+from specs import FANIN, SPLIT
 
 UP, SIDE = "700", "800"
 
@@ -44,6 +44,46 @@ def test_dag_glob_still_shows_edges_to_units_outside_it(mock_run):
     assert r.ok, r.stderr
     assert "aftercorr" in r.stdout or "afterok" in r.stdout
     assert "up" in r.stdout                     # the parent is named by the edge
+
+
+def test_dag_rolls_arrays_up_and_verbose_expands(mock_run):
+    """The unit headers and edges are the view; on a real spec the per-task lines
+    outnumber them ~50:1, so they are opt-in."""
+    rolled = mock_run(FANIN, {}, "dag")
+    assert rolled.ok, rolled.stderr
+    assert "[array 6] down" in rolled.stdout
+    assert "task" not in rolled.stdout
+
+    expanded = mock_run(FANIN, {}, "dag", "-v")
+    assert "task 0: down-a-0" in expanded.stdout
+    assert [ln for ln in expanded.stdout.splitlines()
+            if not ln.startswith("    task")] == rolled.stdout.splitlines()
+
+
+def test_status_glob_restricts_rows(mock_run):
+    r = mock_run(FANIN, {"up": ("COMPLETED", UP), "side": ("FAILED", SIDE)},
+                 "status", "up*")
+    assert r.ok, r.stderr
+    assert "up" in r.stdout
+    assert "side" not in r.stdout and "down" not in r.stdout
+
+
+def test_status_glob_keeps_the_whole_array_row(mock_run):
+    """A unit is the display grain: a glob matching one task of an array must not
+    hide the rest of it, or the roll-up counts would contradict the row."""
+    r = mock_run(SPLIT, {}, "status", "wide-a-0")
+    assert r.ok, r.stderr
+    assert "wide" in r.stdout
+
+
+def test_status_local_never_consults_sacct(mock_run):
+    """A pipeline run through the synchronous runner has no cluster to ask, and an
+    interrupted one leaves a live-looking SUBMITTED record that would reach for it."""
+    r = mock_run(FANIN, {"up": ("RUNNING", UP)}, "status", "--local")
+    assert r.ok, r.stderr
+    # sacct is what turns the seeded SUBMITTED into RUNNING, so the raw log state
+    # surviving is the proof it was never queried.
+    assert "SUBMITTED" in r.stdout and "RUNNING" not in r.stdout
 
 
 BAD_BOOL = """

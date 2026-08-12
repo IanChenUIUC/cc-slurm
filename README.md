@@ -12,11 +12,11 @@ A format for specifying these as a toml is described, and parsed.
 
 Using the `just` command runner is easy, and can understand the subcommands.
 
-Eight verbs, each taking an optional glob over node identities:
+Seven verbs, each taking an optional glob over node identities:
 
 - default: lists the commands
-- dag: the dependency structure the spec expanded into
-- dry: exactly what `run` would submit, and why — same decisions, printed
+- dag: the dependency structure the spec expanded into (arrays roll up to one
+  line; `verbose=1` lists their tasks)
 - run: submits whatever isn't COMPLETED, plus anything downstream
 - status: state, elapsed time, and peak RSS per unit (task-level counts;
   `verbose=1` names the tasks of an array that didn't complete)
@@ -26,9 +26,12 @@ Eight verbs, each taking an optional glob over node identities:
 - cancel: scancel matching live jobs
 
 Behaviour flags are `just` variable overrides, so they go **before** the verb:
-`just local=1 run 'g'` (synchronous, no SLURM), `just force=1 run 'g'` (redo it
-and its downstream), `just force=1 only=1 run 'g'` (redo it alone),
-`just verbose=1 status`. See `spec.md` §11 for which one to reach for.
+`just dry=1 run 'g'` (exactly what `run` would submit, and why — same decisions,
+printed; or, if `g` isn't ready, what it is waiting on), `just deps=1 run 'g'`
+(that plus whatever upstream it still needs), `just local=1 run 'g'` (synchronous,
+no SLURM), `just force=1 run 'g'` (redo it and its downstream),
+`just force=1 only=1 run 'g'` (redo it alone), `just verbose=1 status`.
+See `spec.md` §11 for which one to reach for.
 
 The `template.zip` contains the files that can be copied into any project.
 ```
@@ -58,11 +61,11 @@ On the login node, the `array.sbatch.sh` and `run.sbatch.sh` must be present in 
 Finally, the compute node must have the `CONTAINER`, as specified in the `*.sbatch.sh` files above.
 
 For short testing runs on the login node, entering the `CONTIANER`, running `just local=1 run` will bypass the SLURM scheduler and run jobs directly.
-Otherwise, figuring out what will be run using `just dry` and `just dag` commands, and then `just status`.
+Otherwise, figuring out what will be run using `just dry=1 run` and `just dag` commands, and then `just status`.
 
 ## How commands are materialized
 
-`just dry`/`just run` write the resolved, per-node `command` under `.pipeline/scripts/`:
+`just dry=1 run`/`just run` write the resolved, per-node `command` under `.pipeline/scripts/`:
 
 - **Individual jobs** → one script `<node>`, uploaded and run by `run.sbatch.sh`.
 - **Array recipes** (`array = true`) → a directory `<recipe>.tasks/` holding one

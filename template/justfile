@@ -4,11 +4,14 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 #
 # Behaviour flags are `just` variable overrides, so they go BEFORE the verb:
 #
+#   just dry=1     run 'testing-*'      # what it would submit, and why: same decisions,
+#                                       #   printed instead of issued
 #   just local=1   run 'testing-*'      # here, synchronously, via cc-local (no SLURM)
 #   just force=1   run 'testing-*'      # the inputs or the code changed: redo these
 #                                       #   AND everything downstream
 #   just force=1 only=1 run 'testing-*' # the job flaked: redo these alone and leave
 #                                       #   downstream results in place
+#   just deps=1    run 'testing-*'      # these, plus whatever upstream they still need
 #   just verbose=1 status               # expand rolled-up recipes and name failed tasks
 #   just spec=other.toml dag            # any variable below can be overridden this way
 #
@@ -18,17 +21,21 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 local   := ""
 force   := ""
 only    := ""
+deps    := ""
+dry     := ""
 verbose := ""
 
 spec       := "pipeline.toml"
 cc_submit  := "./cc-submit"
-cc_local   := "bash ./cc-local"
-sacct      := "ssh cc sacct"
-scancel    := "ssh cc scancel"
+cc_local   := "./cc-local"
+ssh        := "ssh cc"
+sacct      := ssh + " sacct"
+scancel    := ssh + " scancel"
 workdir    := ".pipeline"
 slurmlog   := "/scratch/ianchen3/slurm"
 
-# How the runner and the scope are selected, shared by `run` and `dry`.
+# How the runner is selected. `--local` also changes what state means, so `status`
+# takes it too.
 runner  := if local == "" { "--cc-submit '" + cc_submit + "' --sacct '" + sacct + "'" } \
            else { "--cc-submit '" + cc_local + "' --local" }
 
@@ -37,22 +44,12 @@ default:
 
 # ---- inspection: no cluster, no side effects -------------------------------
 
-# Reach for it after editing the spec, to see what it expanded into.
+# Reach for it after editing the spec, to see what it expanded into. Arrays print
+# as one line each; `just verbose=1 dag` lists their tasks.
 
-# The resolved DAG: nodes, edges, and dependency types.
+# The resolved DAG: units, edges, and dependency types.
 dag glob='*':
-    python3 pipeline.py dag {{spec}} '{{glob}}'
-
-# Reach for it before any run you're unsure about: same reconcile and same
-# decisions as `run`, printed instead of issued. Also materializes the job
-# scripts into the state dir so you can read them.
-
-# Exactly what `run` would submit, and why.
-dry glob='*':
-    python3 pipeline.py submit {{spec}} --dry --workdir '{{workdir}}' {{runner}} \
-        {{ if force == '' { "--only '" + glob + "'" } \
-           else { if only == '' { "--rerun '" + glob + "'" } \
-                  else { "--only '" + glob + "' --rerun '" + glob + "'" } } }}
+    python3 pipeline.py dag {{spec}} '{{glob}}' {{ if verbose == '' { '' } else { '-v' } }}
 
 # Multi-unit recipes roll up to one line, counting *tasks* rather than units, so a
 # 3-task failure inside a 240-task array is visible. `just verbose=1 status` expands
@@ -60,8 +57,8 @@ dry glob='*':
 
 # Each unit's state, elapsed time, and peak RSS.
 status glob='*':
-    python3 pipeline.py status {{spec}} --workdir '{{workdir}}' --sacct '{{sacct}}' \
-        {{ if verbose == '' { '' } else { '-v' } }}
+    python3 pipeline.py status {{spec}} '{{glob}}' --workdir '{{workdir}}' --sacct '{{sacct}}' \
+        {{ if verbose == '' { '' } else { '-v' } }} {{ if local == '' { '' } else { '--local' } }}
 
 # Reach for it when `status` isn't enough because the interesting attempt is not
 # the latest one — a unit that timed out, was repaired, and now reads COMPLETED.
@@ -72,11 +69,16 @@ history glob='*':
 
 # ---- running ---------------------------------------------------------------
 
-# See the flag notes at the top of this file for local / force / only.
+# See the flag notes at the top of this file for local / force / only / deps / dry.
+# `dry=1` is the one to reach for before any run you're unsure about: same reconcile
+# and same decisions, printed instead of issued, and it still materializes the job
+# scripts into the state dir so you can read them.
 
 # Submit whatever isn't already COMPLETED, plus anything downstream of it.
 run glob='*':
-    python3 pipeline.py submit {{spec}} --workdir '{{workdir}}' {{runner}} {{ if force == '' { "--only '" + glob + "'" } \
+    python3 pipeline.py submit {{spec}} --workdir '{{workdir}}' {{runner}} \
+        {{ if dry == '' { '' } else { '--dry' } }} {{ if deps == '' { '' } else { '--deps' } }} \
+        {{ if force == '' { "--only '" + glob + "'" } \
            else { if only == '' { "--rerun '" + glob + "'" } \
                   else { "--only '" + glob + "' --rerun '" + glob + "'" } } }}
 
@@ -106,7 +108,7 @@ logs glob='*':
     @patterns="$(python3 pipeline.py log-ids {{spec}} '{{glob}}' --workdir '{{workdir}}' | tr '\n' ' ')"; \
      found=0; \
      if [ -n "${patterns// /}" ]; then \
-       ssh cc "cd {{slurmlog}} && tail -n +1 $patterns" && found=1 || true; \
+       {{ssh}} "cd {{slurmlog}} && tail -n +1 $patterns" && found=1 || true; \
      fi; \
      if compgen -G "{{workdir}}/local-logs/{{glob}}*" >/dev/null; then \
        tail -n +1 {{workdir}}/local-logs/{{glob}}*; found=1; \
