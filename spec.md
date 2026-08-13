@@ -485,10 +485,41 @@ unsatisfiable is killed rather than sitting `PENDING` forever as
   why. `aftercorr` is per-task and therefore exempt: task *i* waits on parent task
   *i*, and the healthy tasks proceed.
 - **`--rerun <glob>`** (transient) force-resubmits nodes whose identity matches,
-  in this invocation only.
+  in this invocation only. It is `invalidate` fused with the run that follows —
+  `just invalidate 'g'; just run` decides identically — with one difference that is
+  the reason it stays a flag: `--rerun` is unioned into the wave *ahead of* the
+  eligibility check, so it beats `--no-retry`, whereas an `INVALIDATED` record counts
+  as attempted and would be skipped. That makes `--rerun` + `--no-retry` the repair
+  move for a single flaked job in a large frontier, and the only form previewable
+  under `--dry` without first writing the mark.
+- **`cancel <glob>`** is the manual "this work is failed" mark, and the one verb that
+  also talks to the cluster: it appends a `CANCELLED` record for every matching unit
+  and `scancel`s whatever is still live, so the log and SLURM agree. `CANCELLED` is an
+  ordinary terminal failure afterwards — resubmit-eligible on the next plain run,
+  skipped under `--no-retry` — so this is a mark, not a tombstone.
+  Talking to the cluster is what keeps it distinct from `invalidate`: it is the verb
+  for work that is **over**, whether or not SLURM still thinks so. It therefore takes
+  no liveness flag in either direction — a live unit is killed, and a glob matching
+  nothing live (a subtree whose dependency died and which never got submitted at all)
+  is simply marked. `--dry` prints what it would mark. Nothing is protected,
+  `COMPLETED` included: the log is append-only, so the prior record survives in
+  `history` and one `complete` restores it.
+  The two halves match different things — `scancel` matches the **log**, so a live job
+  whose recipe was since renamed is still killable, while the mark matches the **spec**,
+  so a unit with no records at all can still be written off.
+  Both halves come out of **one** `cancelled --print-ids` invocation, which reads
+  liveness before it appends and prints the ids afterwards, stdout carrying the ids
+  and the per-unit lines diverted to stderr. They cannot be two processes: the mark
+  makes every one of those units read terminal, so a `cancel-ids` run after it finds
+  nothing and the job survives.
 - **`invalidate <glob>`** (persistent) appends an `INVALIDATED` record for
   matching nodes, so the next `submit` — in any session — reruns them and their
-  downstream. Cleared naturally once a node re-runs to `COMPLETED`.
+  downstream. Cleared naturally once a node re-runs to `COMPLETED`. `--dry` prints
+  what it would mark.
+  It is the one state verb that **refuses a live unit**: `INVALIDATED` is terminal, so
+  reconcile stops collecting that job's result, *and* resubmit-eligible, so the next
+  `submit` puts a second job on the same output files. `cancel` stops the job first;
+  `--force` waives the refusal for a job you know is already gone, warning instead.
 
 - **`--local`** (used by `cc-local`) marks the runner **synchronous**: the job
   runs to completion during submission, so the engine logs its terminal state
@@ -506,7 +537,14 @@ indices is the natural next step now that the state exists.)
 - **`complete <glob>`** (persistent) appends a `COMPLETED` record for matching
   nodes, forcing them to success — for work re-run by hand outside the pipeline.
   Since `COMPLETED` is terminal, `submit` then skips the node *and* does not
-  re-propagate downstream. Overridden by a later `invalidate`/`--rerun`.
+  re-propagate downstream. Overridden by a later `invalidate`/`--rerun`. `--dry`
+  prints what it would mark. On a live unit it **warns rather than refusing**: it
+  loses that job's result, but `submit` skips `COMPLETED`, so nothing is resubmitted.
+
+All three state verbs share one mechanism — append a terminal state — and therefore
+one hazard: reconcile stops watching a job the moment its unit reads terminal. What
+separates them is the state written, whether the cluster is touched, and how each
+answers for a live unit (refuse / warn / stop it).
 - **`--dry`** takes the identical path — reconcile, scope, what-needs-running,
   downstream propagation, the `keep`-filtered dependency edges — but prints the
   runner argv instead of invoking it, and writes **no submission record**. It is
@@ -531,9 +569,9 @@ indices is the natural next step now that the state exists.)
   *submitted and failed* — `status` reports both as `absent`.
 
 **Subcommands:** `dag [<glob>]` (`-v`, `-vv`), `submit` (`--only`/`--rerun <glob>`, `--local`,
-`--deps`, `--dry`, `--no-retry`), `status [<glob>]` (`-v`, `--local`), `history [<glob>]`, `invalidate <glob>`,
-`complete <glob>`, `cancel-ids [<glob>]`, `log-ids [<glob>]`. All accept `--workdir` (default
-`.pipeline`). Every glob matches **node identities**; `cancel-ids` additionally
+`--deps`, `--dry`, `--no-retry`), `status [<glob>]` (`-v`, `--local`), `history [<glob>]`, `invalidate <glob>` (`--force`, `--dry`),
+`complete <glob>` (`--dry`), `cancelled <glob>` (`--dry`, `--print-ids`), `cancel-ids [<glob>]`, `log-ids [<glob>]`. All accept `--workdir` (default
+`.pipeline`). Every glob matches **node identities**; `cancel-ids` (and `cancelled --print-ids`) additionally
 matches unit names in the log, so a live job whose recipe was since renamed or
 deleted is still cancellable.
 
@@ -550,14 +588,15 @@ precede the recipe name):
 | see what a run would do, before doing it — or, if the subset isn't ready, what it is still waiting on | `just dry=1 run 'testing-*'` |
 | run whatever still needs running | `just run` |
 | run one subset, upstream already done | `just run 'testing-*'` |
-| run one subset **and whatever it needs** | `just deps=1 run 'testing-*'` |
+| run one subset **and whatever it needs** | `just up=1 run 'testing-*'` |
 | run it here, synchronously, no SLURM | `just local=1 run 'testing-*'` |
 | redo it: the inputs or the code changed | `just force=1 run 'testing-*'` |
-| redo it: the job flaked, downstream is fine | `just force=1 only=1 run 'testing-*'` |
+| redo it: the job flaked, downstream is fine | `just force=1 down=0 run 'testing-*'` |
 | move the frontier forward, leave every past failure alone | `just retry=0 run` |
 | mark it stale, but don't run it now | `just invalidate 'testing-*'` |
 | tell the DAG about work you did by hand | `just complete 'testing-*'` |
 | stop live jobs | `just cancel 'testing-*'` |
+| write off work that will never run | `just cancel 'testing-gullo-*-online*'` (`dry=1` to preview) |
 | read the output | `just status`, `just logs 'testing-*'` |
 | read it back after a local run, with no cluster | `just local=1 status` |
 | find out which tasks of an array failed | `just verbose=1 status 'testing-*'` |

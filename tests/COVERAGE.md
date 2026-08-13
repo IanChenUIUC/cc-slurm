@@ -46,6 +46,7 @@ the template (`gen-template.sh` copies only the four runners).
 | §11 | `submit --dry`: submits nothing, logs no submission, still materializes; plans only what needs running; matches a real submit's units/deps/flags; in-wave parents as `<placeholders>`; honors `--rerun`; reports unmet `--only` prerequisites (transitively, topo order) instead of erroring | ✅ | `test_dry.py` |
 | §11 | `--deps`: pulls the whole upstream chain, stops at a COMPLETED or live ancestor, no downstream propagation, no-op without `--only` | ✅ | `test_only.py` |
 | §11 | `cancel-ids`: omits terminal, honors globs, still reaches units absent from the spec | ✅ | `test_verbs.py` |
+| §11 | `cancelled --print-ids`: ids read before the mark, ids on stdout / prose on stderr, reaches a renamed-away unit | ✅ | `test_cancel.py` |
 | §11 | `dag <glob>` restricts units but keeps edges to parents outside the glob | ✅ | `test_verbs.py` |
 | §11 | `dag` rolls up by recipe with inline edges; `-v` expands to units, `-vv` to tasks, each a strict expansion | ✅ | `test_verbs.py` |
 | §11 | `--no-retry`: a past failure (and INVALIDATED) is not retried, its subtree is skipped with a reason, `--rerun` overrides, a clean DAG decides identically | ✅ | `test_noretry.py` |
@@ -53,7 +54,9 @@ the template (`gen-template.sh` copies only the four runners).
 | §11 | an unrecognized sacct state reads as live, so it is never resubmitted underneath a running job | ✅ | `test_noretry.py` |
 | §11 | `status` display: bar classes, a 1-in-N failure keeps a cell, ABSENT (incl. INVALIDATED) counted, color only on a TTY, elapsed compared as a duration | ✅ | `test_status_display.py` |
 | §11 | `status <glob>` restricts rows, keeps a whole array whose task matched; `--local` never consults sacct | ✅ | `test_verbs.py` |
-| §11 | `invalidate` / `complete` / `--rerun` / `log-ids` | TODO | — |
+| §11 | the three state verbs on a **live** unit: `cancel` marks silently (it scancels), `complete` marks with a warning, `invalidate` refuses and writes nothing until `--force` | ✅ | `test_cancel.py` |
+| §11 | `cancel` needs no flag for work that never ran; `--dry` writes nothing for all three; CANCELLED stays rerunnable; a mistaken mark is recoverable via the append-only log | ✅ | `test_cancel.py` |
+| §11 | `--rerun` / `log-ids` | TODO | — |
 | §7  | valueless slurm flag: `true` emits `-x`; a non-boolean is a hard error | ✅ | `test_verbs.py` |
 
 ## §10 hard-error list

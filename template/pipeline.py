@@ -9,6 +9,7 @@ emit cc-submit calls.
     pipeline.py history    spec.toml [<glob>]  # every logged attempt, per unit
     pipeline.py invalidate spec.toml <glob>    # mark stale: next submit reruns it
     pipeline.py complete   spec.toml <glob>    # force to success (ran it by hand)
+    pipeline.py cancelled  spec.toml <glob>    # write off work that will never run
     pipeline.py cancel-ids spec.toml [<glob>]  # live job ids, for scancel
     pipeline.py log-ids    spec.toml [<glob>]  # remote log filename patterns
 
@@ -1065,20 +1066,28 @@ class Engine:
         return [u for u in (units if units is not None else self.units)
                 if any(fnmatch.fnmatch(n.ident, g) for g in globs for n in u.nodes)]
 
-    def cancel_ids(self, globs=("*",), workdir=".pipeline"):
-        """Print the job ids of every still-live (non-terminal) unit matching a glob,
-        one per line, for piping to scancel.
+    def _live_job_ids(self, last, globs):
+        """The job ids of every still-live unit matching a glob, in log order.
 
         Matched against the *log*, not the spec, so a live job whose recipe was since
-        renamed or deleted is still cancellable -- which is the point of `cancel`."""
-        last = self._read_log(pathlib.Path(workdir) / "run.jsonl")
+        renamed or deleted is still cancellable -- which is the point of `cancel`.
+        `last` is passed in rather than read here because the caller that marks must
+        take this reading *before* it appends a terminal state over it."""
+        ids = []
         for name, rec in last.items():
             if not is_live(rec.get("state")) or not rec.get("job_id"):
                 continue
             # A reconcile record carries no node list, so fall back to the unit name.
             idents = [name] + (rec.get("nodes") or [])
             if any(fnmatch.fnmatch(i, g) for g in globs for i in idents):
-                print(rec["job_id"])
+                ids.append(rec["job_id"])
+        return ids
+
+    def cancel_ids(self, globs=("*",), workdir=".pipeline"):
+        """Print live job ids one per line, for piping to scancel."""
+        last = self._read_log(pathlib.Path(workdir) / "run.jsonl")
+        for jid in self._live_job_ids(last, globs):
+            print(jid)
 
     def log_ids(self, globs, workdir=".pipeline"):
         """Print, one per line, the remote SLURM log filename pattern for each
@@ -1131,39 +1140,101 @@ class Engine:
                     cols.append(" " + self._hist(c))
                 print("".join(cols).rstrip())
 
-    def _force_state(self, globs, state, verb, workdir):
+    def _force_state(self, globs, state, verb, workdir, dry=False, on_live="warn",
+                     print_ids=False):
         """Append a `state` record for every unit matching a glob, carrying the prior
-        job_id so `logs`/`cancel` still resolve."""
+        job_id so `logs`/`cancel` still resolve.
+
+        Every state written here is terminal, so reconcile stops querying the job id:
+        a *live* unit marked this way keeps running with nobody left to collect its
+        result. `on_live` is how each verb answers for that -- `"warn"` because these
+        are deliberate manual overrides, `"refuse"` where the state written is also
+        resubmit-eligible and the next `submit` would put a second job on the same
+        output files, `"ignore"` for the caller that stops the job itself.
+
+        `print_ids` makes stdout a data channel -- the live job ids, read before the
+        append and printed after it, with the per-unit lines diverted to stderr. It
+        has to happen here rather than in a second `cancel-ids` process because by
+        then the mark has already made every one of those units read terminal."""
         wd = pathlib.Path(workdir)
         wd.mkdir(parents=True, exist_ok=True)
         log_path = wd / "run.jsonl"
         last = self._read_log(log_path)
         matched = self._matching_units(globs)
+        pfx = "(dry) " if dry else ""
+        out = sys.stderr if print_ids else sys.stdout
+        ids = self._live_job_ids(last, globs) if print_ids else []
         if not matched:
+            # Still emit the ids: a live job whose recipe was renamed away has no
+            # unit left to mark, and killing it is the whole reason to ask.
             print(f"{verb}: no nodes matched", file=sys.stderr)
+            for jid in ids:
+                print(jid)
             return
-        with open(log_path, "a") as f:
+        live = [(u.name, (last.get(u.name) or {}).get("job_id")) for u in matched
+                if is_live((last.get(u.name) or {}).get("state"))]
+        if live and on_live == "refuse":
+            named = [f"{n} (job {j})" for n, j in sorted(live)]
+            raise PipelineError(", ".join(named[:5])
+                                + (f" (+{len(named) - 5} more)" if len(named) > 5 else "")
+                                + (" is" if len(named) == 1 else " are")
+                                + " live -- the next run would submit a second job"
+                                  " writing the same output. `just cancel` stops it"
+                                  " first, or pass force=1")
+        for name, jid in live if on_live == "warn" else ():
+            print(f"{pfx}warning: {name} is live (job {jid}) -- orphaned, its result"
+                  " will not be recorded", file=sys.stderr)
+        with open(os.devnull if dry else log_path, "a") as f:
             for u in matched:
                 f.write(json.dumps({"unit": u.name, "kind": u.kind,
                                     "job_id": (last.get(u.name) or {}).get("job_id"),
                                     "state": state, "event": "force",
                                     "nodes": [n.ident for n in u.nodes],
                                     "time": time.time()}) + "\n")
-                print(f"{verb} {u.name}")
+                print(f"{pfx}{verb} {u.name}", file=out)
+        for jid in ids:
+            print(jid)
 
-    def invalidate(self, globs, workdir=".pipeline"):
+    def cancelled(self, globs, workdir=".pipeline", dry=False, print_ids=False):
+        """Record CANCELLED for matching units -- the log half of `cancel`, whose
+        other half is scancel.
+
+        The one state verb that also talks to the cluster, which is what keeps it
+        distinct from `invalidate`: it is for work that is over, whether or not slurm
+        still thinks so. It therefore needs no liveness guard -- a live unit is
+        killed, and a glob matching nothing live (a subtree whose dependency died and
+        which never got submitted) is simply marked.
+
+        CANCELLED is an ordinary terminal failure afterwards, so this is a mark, not
+        a tombstone. Nothing is protected, not even COMPLETED -- `run.jsonl` is
+        append-only, so the prior state is still in `history` and one `complete`
+        restores it."""
+        self._force_state(globs, "CANCELLED", "cancelled", workdir, dry=dry,
+                          on_live="ignore", print_ids=print_ids)
+
+    def invalidate(self, globs, workdir=".pipeline", force=False, dry=False):
         """Mark matching nodes stale so the next `submit` reruns them (and their
         downstream). Persistent across sessions; cleared naturally once a node
-        re-runs to COMPLETED. INVALIDATED is deliberately terminal, so
-        reconcile won't query sacct for it and submit won't treat it as live."""
-        self._force_state(globs, "INVALIDATED", "invalidated", workdir)
+        re-runs to COMPLETED. INVALIDATED is deliberately terminal, so reconcile
+        won't query sacct for it and submit won't treat it as live.
 
-    def complete(self, globs, workdir=".pipeline"):
+        The one state verb that guards: because INVALIDATED is also resubmit-eligible,
+        marking a live unit orphans its job *and* puts a second one on the same output
+        files. `cancel` stops the job first; `force` waives the guard for a job you
+        know is already gone."""
+        self._force_state(globs, "INVALIDATED", "invalidated", workdir, dry=dry,
+                          on_live="warn" if force else "refuse")
+
+    def complete(self, globs, workdir=".pipeline", dry=False):
         """Force matching nodes to success (e.g. after manually re-running a failed
         job). COMPLETED is terminal, so reconcile won't re-query sacct and submit
         will skip the node and won't re-propagate downstream. A later
-        `invalidate`/`--rerun` overrides this normally."""
-        self._force_state(globs, "COMPLETED", "completed", workdir)
+        `invalidate`/`--rerun` overrides this normally.
+
+        Marking a live unit only loses that job's result -- submit skips COMPLETED,
+        so nothing is resubmitted -- which is why this warns where `invalidate`
+        refuses."""
+        self._force_state(globs, "COMPLETED", "completed", workdir, dry=dry)
 
     def _unready_ancestors(self, units, state, needs_run):
         """Units upstream of `units` that would have to run first, in topo order so
@@ -1354,8 +1425,8 @@ class Unit:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["dag", "submit", "status", "history",
-                                       "invalidate", "complete", "cancel-ids",
-                                       "log-ids"])
+                                       "invalidate", "complete", "cancelled",
+                                       "cancel-ids", "log-ids"])
     ap.add_argument("spec")
     ap.add_argument("globs", nargs="*",
                     help="node-identity globs (dag / status / history / invalidate / "
@@ -1374,7 +1445,14 @@ def main():
                     help="with --only: also run the scope's upstream, wherever it isn't "
                          "already COMPLETED or live (no-op without --only)")
     ap.add_argument("--dry", action="store_true",
-                    help="submit: decide identically, but print the runner argv and log nothing")
+                    help="submit: decide identically, but print the runner argv and log "
+                         "nothing; invalidate/complete/cancelled: print what would be "
+                         "marked, write nothing")
+    ap.add_argument("--force", action="store_true",
+                    help="invalidate: mark live units too, orphaning their jobs")
+    ap.add_argument("--print-ids", action="store_true",
+                    help="cancelled: print the live job ids to stdout, for piping to "
+                         "scancel, and the per-unit lines to stderr")
     ap.add_argument("--no-retry", action="store_true",
                     help="submit: run only what has never been attempted -- skip anything "
                          "the log already records (failed, timed out, invalidated), and "
@@ -1400,9 +1478,12 @@ def main():
         elif args.action == "history":
             eng.history(args.globs or ["*"], workdir=wd)
         elif args.action == "invalidate":
-            eng.invalidate(args.globs, workdir=wd)
+            eng.invalidate(args.globs, workdir=wd, force=args.force, dry=args.dry)
         elif args.action == "complete":
-            eng.complete(args.globs, workdir=wd)
+            eng.complete(args.globs, workdir=wd, dry=args.dry)
+        elif args.action == "cancelled":
+            eng.cancelled(args.globs, workdir=wd, dry=args.dry,
+                          print_ids=args.print_ids)
         elif args.action == "cancel-ids":
             eng.cancel_ids(args.globs or ["*"], workdir=wd)
         elif args.action == "log-ids":

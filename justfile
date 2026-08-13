@@ -8,10 +8,11 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 #                                       #   printed instead of issued
 #   just local=1   run 'testing-*'      # here, synchronously, via cc-local (no SLURM)
 #   just force=1   run 'testing-*'      # the inputs or the code changed: redo these
-#                                       #   AND everything downstream
-#   just force=1 only=1 run 'testing-*' # the job flaked: redo these alone and leave
+#                                       #   AND everything downstream. Sugar for
+#                                       #   `just invalidate` followed by `just run`
+#   just force=1 down=0 run 'testing-*' # the job flaked: redo these alone and leave
 #                                       #   downstream results in place
-#   just deps=1    run 'testing-*'      # these, plus whatever upstream they still need
+#   just up=1      run 'testing-*'      # these, plus whatever upstream they still need
 #   just retry=0   run                  # only what has never been attempted: leave every
 #                                       #   past failure, and its downstream, alone
 #   just verbose=1 status               # expand rolled-up recipes and name failed tasks
@@ -22,8 +23,8 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 local   := ""
 force   := ""
-only    := ""
-deps    := ""
+up      := ""
+down    := "1"
 retry   := "1"
 dry     := ""
 verbose := ""
@@ -53,75 +54,28 @@ help:
     @echo 'flags (go BEFORE the verb):'
     @echo '  local=1    run here, synchronously, no SLURM'
     @echo '  force=1    redo these and everything downstream'
-    @echo '  only=1     with force: these alone'
-    @echo '  deps=1     also run whatever upstream they need'
+    @echo '  down=0     with force: these alone, leave downstream results in place'
+    @echo '  up=1       also run whatever upstream they need'
     @echo '  dry=1      print the decisions instead of issuing them'
     @echo '  retry=0    skip anything already attempted and failed'
     @echo '  verbose=1  expand rolled-up rows to per-unit ones'
     @echo
     @echo 'verbs: just --list'
 
-# ---- inspection: no cluster, no side effects -------------------------------
+# ---- observing: what the DAG is, and what happened to it ------------------
 
-# Reach for it after editing the spec, to see what it expanded into. Arrays print
-# as one line each; `just verbose=1 dag` lists their tasks.
-
-# The resolved DAG: units, edges, and dependency types.
+# The resolved DAG: one line per recipe, with its edges.
 dag glob='*':
     python3 pipeline.py dag {{spec}} '{{glob}}' {{ if verbose == '' { '' } else { '-v' } }}
 
-# Multi-unit recipes roll up to one line, counting *tasks* rather than units, so a
-# 3-task failure inside a 240-task array is visible. `just verbose=1 status` expands
-# to one row per unit and names the tasks that did not complete.
-
-# Each unit's state, elapsed time, and peak RSS.
+# Per recipe: elapsed, peak RSS, and a task histogram.
 status glob='*':
     python3 pipeline.py status {{spec}} '{{glob}}' --workdir '{{workdir}}' --sacct '{{sacct}}' \
         {{ if verbose == '' { '' } else { '-v' } }} {{ if local == '' { '' } else { '--local' } }}
 
-# Reach for it when `status` isn't enough because the interesting attempt is not
-# the latest one — a unit that timed out, was repaired, and now reads COMPLETED.
-
 # Every logged attempt per unit: when, what happened, job id, state, RSS.
 history glob='*':
     python3 pipeline.py history {{spec}} '{{glob}}' --workdir '{{workdir}}'
-
-# ---- running ---------------------------------------------------------------
-
-# See the flag notes at the top of this file for local / force / only / deps / dry.
-# `dry=1` is the one to reach for before any run you're unsure about: same reconcile
-# and same decisions, printed instead of issued, and it still materializes the job
-# scripts into the state dir so you can read them.
-
-# Submit whatever isn't already COMPLETED, plus anything downstream of it.
-run glob='*':
-    python3 pipeline.py submit {{spec}} --workdir '{{workdir}}' {{runner}} \
-        {{ if dry == '' { '' } else { '--dry' } }} {{ if deps == '' { '' } else { '--deps' } }} \
-        {{ if retry == '0' { '--no-retry' } else { '' } }} \
-        {{ if force == '' { "--only '" + glob + "'" } \
-           else { if only == '' { "--rerun '" + glob + "'" } \
-                  else { "--only '" + glob + "' --rerun '" + glob + "'" } } }}
-
-# ---- state -----------------------------------------------------------------
-
-# Reach for it when you know something is wrong but aren't ready to rerun now
-# (`just force=1 run` is the do-it-now version).
-
-# Mark units stale; the next `run` redoes them and their downstream.
-invalidate glob:
-    python3 pipeline.py invalidate {{spec}} '{{glob}}' --workdir '{{workdir}}'
-
-# Reach for it when you re-ran the work by hand outside the pipeline and just
-# need the DAG to agree. Undone by a later `invalidate`.
-
-# Force units to COMPLETED.
-complete glob:
-    python3 pipeline.py complete {{spec}} '{{glob}}' --workdir '{{workdir}}'
-
-# ---- utilities -------------------------------------------------------------
-
-# Remote logs are slurm-<jobid>.out (arrays: slurm-<jobid>_<idx>.out), so GLOB is
-# mapped to job-id patterns via `log-ids` and tailed over ssh.
 
 # Tail the remote SLURM logs and any local-run logs for matching units.
 logs glob='*':
@@ -135,12 +89,38 @@ logs glob='*':
      fi; \
      [ "$found" = 1 ] || echo "no logs match {{glob}}"
 
-# Matched against the run log, so it still reaches jobs whose recipe has since
-# been renamed or deleted.
+# ---- running ---------------------------------------------------------------
 
-# scancel every still-live job matching GLOB.
+# See the flag notes at the top of this file for local / force / down / up / dry.
+# `dry=1` is the one to reach for before any run you're unsure about: printed
+# instead of issued.
+
+# Submit whatever isn't already COMPLETED, plus anything downstream of it.
+run glob='*':
+    python3 pipeline.py submit {{spec}} --workdir '{{workdir}}' {{runner}} \
+        {{ if dry == '' { '' } else { '--dry' } }} {{ if up == '' { '' } else { '--deps' } }} \
+        {{ if retry == '0' { '--no-retry' } else { '' } }} \
+        {{ if force == '' { "--only '" + glob + "'" } \
+           else { if down == '0' { "--only '" + glob + "' --rerun '" + glob + "'" } \
+                  else { "--rerun '" + glob + "'" } } }}
+
+# ---- state -----------------------------------------------------------------
+
+# Mark units stale; the next `run` redoes them and their downstream.
+invalidate glob:
+    python3 pipeline.py invalidate {{spec}} '{{glob}}' --workdir '{{workdir}}' \
+        {{ if force == '' { '' } else { '--force' } }} \
+        {{ if dry == '' { '' } else { '--dry' } }}
+
+# Force units to COMPLETED.
+complete glob:
+    python3 pipeline.py complete {{spec}} '{{glob}}' --workdir '{{workdir}}' \
+        {{ if dry == '' { '' } else { '--dry' } }}
+
+# Mark units CANCELLED and scancel whatever is live.
 cancel glob='*':
-    @ids="$(python3 pipeline.py cancel-ids {{spec}} '{{glob}}' --workdir '{{workdir}}' | tr '\n' ' ')"; \
-     if [ -z "${ids// /}" ]; then echo "no live jobs match {{glob}}"; else \
-       {{scancel}} $ids && echo "cancelled: $ids"; \
-     fi
+    @ids="$(python3 pipeline.py cancelled {{spec}} '{{glob}}' --workdir '{{workdir}}' \
+              --print-ids {{ if dry == '' { '' } else { '--dry' } }} | tr '\n' ' ')"; \
+     if [ -z "${ids// /}" ]; then echo "no live jobs match {{glob}}"; \
+     elif [ -n '{{dry}}' ]; then echo "(dry) would scancel: $ids"; \
+     else {{scancel}} $ids && echo "scancelled: $ids"; fi
