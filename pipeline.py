@@ -224,6 +224,13 @@ class Engine:
     def _sortkey(n):
         return tuple(str(v) for _, v in scalar_items(n.binding))
 
+    def _logged_nodes(self, u):
+        """The unit's node idents in `array_index` order, which is what a log record must
+        carry: readers join a task index straight into this list, and `_build_units`
+        numbers tasks by `_sortkey` rather than by declaration order. Keeping the two in
+        step here means a later change to `_sortkey` cannot silently permute the join."""
+        return [n.ident for n in sorted(u.nodes, key=self._sortkey)]
+
     def _records(self, raw, recipe):
         if raw is None:
             return [{}]
@@ -1189,7 +1196,7 @@ class Engine:
                 f.write(json.dumps({"unit": u.name, "kind": u.kind,
                                     "job_id": (last.get(u.name) or {}).get("job_id"),
                                     "state": state, "event": "force",
-                                    "nodes": [n.ident for n in u.nodes],
+                                    "nodes": self._logged_nodes(u),
                                     "time": time.time()}) + "\n")
                 print(f"{pfx}{verb} {u.name}", file=out)
         for jid in ids:
@@ -1379,7 +1386,7 @@ class Engine:
 
         def record(u, jid, st):
             return json.dumps({"unit": u.name, "kind": u.kind, "job_id": jid, "state": st,
-                               "event": "submit", "nodes": [n.ident for n in u.nodes],
+                               "event": "submit", "nodes": self._logged_nodes(u),
                                "time": time.time()}) + "\n"
 
         # An in-wave parent has no id yet, while a live or skipped one keeps its logged
