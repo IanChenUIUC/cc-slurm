@@ -185,6 +185,9 @@ def sbatch(
 @click.option("--job-name", "-j")
 @click.option("--depends-on", "-d", multiple=True, help="afterok dependency tokens")
 @click.option("--aftercorr", "-C", multiple=True, help="aftercorr array tokens")
+@click.option("--array-indices", "-A",
+              help="slurm --array expression naming the subset of tasks to run "
+                   "(e.g. '3,7,11-14'); default is every task script in the dir")
 @click.option("--cpus-per-task", "-c")
 @click.option("--partition", "-p")
 @click.option("--mem", "-m")
@@ -195,6 +198,7 @@ def array(
     job_name,
     depends_on,
     aftercorr,
+    array_indices,
     cpus_per_task,
     partition,
     mem,
@@ -205,7 +209,11 @@ def array(
 
     The directory holds one `task-<i>.sh` per array index (i = 0..N-1); each
     script is a full, possibly multi-line command run intact by
-    `array.sbatch.sh`. Task count is the number of such scripts."""
+    `array.sbatch.sh`. Task count is the number of such scripts.
+
+    `--array-indices` runs only some of them, for resuming an array whose other
+    tasks already succeeded. The scripts keep their own indices either way, so
+    `array.sbatch.sh`'s `task-$SLURM_ARRAY_TASK_ID` lookup is unaffected."""
     if not tasks_dir:
         tasks_dir = click.prompt(
             "Enter the path to the tasks directory", type=click.Path(exists=True)
@@ -224,7 +232,8 @@ def array(
     opts = []
     if job_name:
         opts.append(f"--job-name={shlex.quote(job_name)}")
-    opts.append(f"--array=0-{n_cmds - 1}")
+    opts.append(f"--array={array_indices}" if array_indices
+                else f"--array=0-{n_cmds - 1}")
     dep = build_dependency(afterok=depends_on, aftercorr=aftercorr)
     if dep:
         opts.append(f"--dependency={dep}")

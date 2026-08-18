@@ -21,6 +21,7 @@ set -uo pipefail
 CMD="${1:-}"; shift || true
 
 name=""
+indices=""
 pos=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,6 +33,7 @@ while [ $# -gt 0 ]; do
     -p|--partition)     shift 2 ;;     # ignored
     -t|--time)          shift 2 ;;     # ignored
     -x|--exclusive)     shift ;;       # ignored (valueless flag)
+    -A|--array-indices) indices="${2:-}"; shift 2 ;;   # honoured: a task subset
     --) shift ;;
     -*) shift ;;                       # unknown flag: skip
     *)  pos+=("$1"); shift ;;
@@ -55,7 +57,22 @@ case "$CMD" in
     tdir="${pos[0]}"
     echo "[cc-local] array ${name:-$tdir}" >&2
     rc_all=0
-    for script in $(ls "$tdir"/task-* | sort -V); do
+    # A subset run has to be honoured rather than ignored like the resource flags:
+    # re-running every task would redo the work the engine deliberately skipped.
+    scripts=()
+    if [ -n "$indices" ]; then
+      IFS=',' read -ra parts <<< "${indices%%\%*}"
+      for part in "${parts[@]}"; do
+        if [[ "$part" == *-* ]]; then
+          for ((k=${part%%-*}; k<=${part##*-}; k++)); do scripts+=("$tdir/task-$k"); done
+        else
+          scripts+=("$tdir/task-$part")
+        fi
+      done
+    else
+      while IFS= read -r f; do scripts+=("$f"); done < <(ls "$tdir"/task-* | sort -V)
+    fi
+    for script in "${scripts[@]}"; do
       i=$(basename "$script"); i=${i#task-}
       out="$LOGDIR/${name:-array}.$id.$i.out"
       "$script" > "$out" 2>&1 || {

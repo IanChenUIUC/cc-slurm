@@ -58,6 +58,18 @@ class Submit:
     aftercorr: list                 # ids from `-C`
     flags: dict                     # {"-c": "1", "-m": "128GB", ...}
     job_id: str | None = None       # id the fake runner returned for this unit
+    array_indices: str | None = None  # -A: the task subset, None when the whole array
+
+    @property
+    def indices(self):
+        """`array_indices` expanded to the sorted int list it names, or None."""
+        if self.array_indices is None:
+            return None
+        out = []
+        for part in self.array_indices.split(","):
+            lo, _, hi = part.partition("-")
+            out.extend(range(int(lo), int(hi) + 1) if hi else [int(lo)])
+        return sorted(out)
 
 
 @dataclasses.dataclass
@@ -135,6 +147,7 @@ def _parse_argv(argv):
     """A runner argv (from `kind` onward) -> Submit, or None if unnamed."""
     kind = argv[0]                              # "sbatch" | "array"
     name, afterok, aftercorr, flags = None, [], [], {}
+    indices = None
     i = 1
     while i < len(argv):
         tok = argv[i]
@@ -144,13 +157,16 @@ def _parse_argv(argv):
             afterok.append(argv[i + 1]); i += 2
         elif tok == "-C":
             aftercorr.append(argv[i + 1]); i += 2
+        elif tok == "-A":
+            indices = argv[i + 1]; i += 2
         elif tok in ("-c", "-m", "-p", "-t"):
             flags[tok] = argv[i + 1]; i += 2
         elif tok in ("-x",):
             flags[tok] = True; i += 1
         else:
             i += 1
-    return Submit(name, kind, afterok, aftercorr, flags) if name is not None else None
+    return (Submit(name, kind, afterok, aftercorr, flags, array_indices=indices)
+            if name is not None else None)
 
 
 def _parse_capture(capture):

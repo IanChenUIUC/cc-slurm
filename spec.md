@@ -529,10 +529,21 @@ unsatisfiable is killed rather than sitting `PENDING` forever as
   locally-run pipeline need no cluster access.
 
 Array units reconcile atomically: an array is `COMPLETED` only if all its tasks
-are, else the whole array is resubmit-eligible. Per-task state is *recorded and
-reported* (see the `tasks` table above and `status -v`), but not yet acted on —
-resubmission is still whole-array. (Per-task resubmission via sparse `--array=`
-indices is the natural next step now that the state exists.)
+are, else it is resubmit-eligible — but only its **non-`COMPLETED` tasks** are
+resubmitted, as a sparse `--array=` index set. Two consequences worth knowing:
+
+- An array that already finished can take on tasks a **widened** sweep axis added,
+  without redoing the ones already paid for; a partially failed array retries just
+  the failures. `--rerun` remains the verb for redoing work that *did* succeed, and
+  runs the unit entire.
+- A unit's state therefore spans several records: a resubmission's record describes
+  only the tasks it covered (`indices`), and the tasks it left alone keep the verdict
+  of the run that did cover them. State is folded **per node ident**, not per unit and
+  not by task index — inserting a value into a swept list renumbers the tasks, so only
+  the `nodes` list each record carries can undo that.
+
+A unit whose latest record is still live is left alone whole, new tasks included:
+one live job per unit is all the log's single `job_id` can describe.
 
 - **`complete <glob>`** (persistent) appends a `COMPLETED` record for matching
   nodes, forcing them to success — for work re-run by hand outside the pipeline.

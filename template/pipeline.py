@@ -648,7 +648,7 @@ class Engine:
                     afterok.extend(pids)
         return afterok, aftercorr
 
-    def _doomed_afterok(self, u, state):
+    def _doomed_afterok(self, u, state, nodestates):
         """(parent unit, failed task count) for every afterok parent of `u` that is
         still live but already has failed tasks.
 
@@ -666,7 +666,7 @@ class Engine:
             rec = state.get(pu.name) if pu else None
             if not rec or not is_live(rec.get("state")):
                 continue
-            bad = [n for n, st in self._task_states(pu, rec).items()
+            bad = [n for n, st in self._task_states(pu, nodestates.get(pu.name)).items()
                    if not is_live(st) and st != "COMPLETED"]
             if idx is not None:
                 bad = [n for n in bad if str(n.array_index) == idx]
@@ -674,7 +674,7 @@ class Engine:
                 out.append((pu, len(bad)))
         return out
 
-    def _cmd(self, u, uid, script, keep=None):
+    def _cmd(self, u, uid, script, keep=None, indices=None):
         afterok, aftercorr = self._dep_tokens(u, uid, keep)
         deps = " ".join(f"-d {t}" for t in afterok)
         deps += ("" if not aftercorr else " " + " ".join(f"-C {t}" for t in aftercorr))
@@ -687,7 +687,10 @@ class Engine:
         deps = deps.strip()
         if u.kind == "individual":
             return f"cc-submit sbatch {script} -j {u.name} {flags} {deps}".rstrip()
-        return f"cc-submit array {script} -j {u.name} {flags} {deps}".rstrip()
+        # Only a genuine subset is named: a whole-array run keeps emitting the plain
+        # form, so the runners' own 0..N-1 default stays the common path.
+        idx = "" if indices is None else f" -A {self._index_spec(indices)}"
+        return f"cc-submit array {script} -j {u.name}{idx} {flags} {deps}".rstrip()
 
     def _edge_recipes(self, u):
         """(afterok, aftercorr) as sorted parent *recipe* names, so the sibling units
@@ -777,14 +780,15 @@ class Engine:
             self._write_script(tdir / f"task-{n.array_index}", n)
         return tdir
 
-    def _runner_argv(self, cc, u, wd, uid, keep=None):
+    def _runner_argv(self, cc, u, wd, uid, keep=None, indices=None):
         """The exact argv the runner receives; `cc` replaces the leading 'cc-submit'."""
-        cmd = self._cmd(u, uid, str(self._materialize(u, wd)), keep)
+        cmd = self._cmd(u, uid, str(self._materialize(u, wd)), keep, indices)
         return shlex.split(cc) + cmd.split()[1:]
 
-    def _invoke_cc(self, cc, u, wd, keep=None):
-        return subprocess.run(self._runner_argv(cc, u, wd, lambda x: x.job_id, keep),
-                              capture_output=True, text=True)
+    def _invoke_cc(self, cc, u, wd, keep=None, indices=None):
+        return subprocess.run(
+            self._runner_argv(cc, u, wd, lambda x: x.job_id, keep, indices),
+            capture_output=True, text=True)
 
     @staticmethod
     def _read_log_all(log_path):
@@ -801,6 +805,63 @@ class Engine:
     @classmethod
     def _read_log(cls, log_path):
         return {unit: recs[-1] for unit, recs in cls._read_log_all(log_path).items()}
+
+    @staticmethod
+    def _fold_nodes(recs, idents):
+        """{node ident: its latest observation} across a unit's whole record history.
+
+        A partial resubmission's record describes only the tasks it ran, so the tasks
+        it left alone have to keep the verdict of the run that did -- folding just the
+        last record would lose them. `nodes` (the unit's idents in task order) and
+        `indices` (the subset actually submitted) are written by `submit` only;
+        reconcile and the state verbs speak for whatever the last submission covered,
+        so both carry forward. Within a record, a per-task table speaks only for the
+        indices in it, and a record without one speaks for the whole covered subset.
+
+        Keyed on ident, never on a recomputed `array_index`: inserting a value into a
+        swept list renumbers the tasks, and only the logged order can undo that.
+
+        `idents` is the unit's current node order, standing in until a record supplies
+        its own. That is what a record predating per-task folding, an individual job,
+        and every `invalidate`/`complete`/`cancel` record (which carry no `nodes`)
+        need to keep meaning "this state, for the whole unit"."""
+        out, nodes, cover = {}, list(idents), None
+        for r in recs:
+            if r.get("nodes"):
+                nodes, cover = r["nodes"], r.get("indices")
+            if not nodes:
+                continue
+            base = {k: r.get(k) for k in ("job_id", "elapsed", "max_rss")}
+            tasks = r.get("tasks") or {}
+            # The record speaks for everything it covered; its task table only refines
+            # that. sacct does sometimes omit a task's row, and such a task has to keep
+            # reading as the unit did rather than silently becoming unrun.
+            for i in (range(len(nodes)) if cover is None else cover):
+                if i < len(nodes):
+                    out[nodes[i]] = {**base, "state": r.get("state")}
+            for i, t in tasks.items():
+                if i.isdigit() and int(i) < len(nodes):
+                    out[nodes[int(i)]] = {**base, **t}
+        return out
+
+    def _node_states(self, log_path):
+        """{unit name: {node ident: observation}} -- the log's per-node view."""
+        idents = {u.name: self._logged_nodes(u) for u in self.units}
+        return {unit: self._fold_nodes(recs, idents.get(unit, []))
+                for unit, recs in self._read_log_all(log_path).items()}
+
+    @staticmethod
+    def _index_spec(indices):
+        """A sorted index list as a slurm `--array` expression, collapsing runs."""
+        out, idx = [], sorted(set(indices))
+        i = 0
+        while i < len(idx):
+            j = i
+            while j + 1 < len(idx) and idx[j + 1] == idx[j] + 1:
+                j += 1
+            out.append(str(idx[i]) if j == i else f"{idx[i]}-{idx[j]}")
+            i = j + 1
+        return ",".join(out)
 
     # ---- sacct reconciliation ----
     @staticmethod
@@ -945,21 +1006,20 @@ class Engine:
                 return f"{b:.0f}{unit}"
             b /= 1024
 
-    def _task_states(self, u, rec):
-        """{node: state} for one unit's tasks.
+    @staticmethod
+    def _task_states(u, nodestates):
+        """{node: state} for one unit's tasks, read out of `_fold_nodes`.
 
-        Uses sacct's per-task table when the record carries one, and otherwise
-        attributes the unit's own state to every node -- which is exactly what an
-        individual job, a record written before per-task folding existed, and a
-        never-submitted unit all legitimately look like.
+        A node the log has never covered reads ABSENT -- what a never-submitted unit,
+        an untouched task of a partially submitted array, and a node newly added to a
+        widened axis all legitimately look like.
 
         INVALIDATED reports as ABSENT: both mean "no valid result here", and which
         one it was is what `history` is for."""
-        st = (rec or {}).get("state") or "ABSENT"
-        st = "ABSENT" if st == "INVALIDATED" else st
-        tasks = (rec or {}).get("tasks") or {}
-        return {n: (tasks.get(str(n.array_index)) or {}).get("state", st)
-                for n in u.nodes}
+        def one(n):
+            st = (nodestates or {}).get(n.ident, {}).get("state") or "ABSENT"
+            return "ABSENT" if st == "INVALIDATED" else st
+        return {n: one(n) for n in u.nodes}
 
     @classmethod
     def _hist(cls, counts, color=False):
@@ -1005,6 +1065,8 @@ class Engine:
         that only ever ran through the synchronous runner."""
         log_path = pathlib.Path(workdir) / "run.jsonl"
         state = self._read_log(log_path) if local else self.reconcile(sacct, log_path)
+        # After reconcile, so the states it just appended are part of the fold.
+        nodestates = self._node_states(log_path)
         color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
         print(f"{'unit':36} {'elapsed':10} {'maxrss':7} {'scale':22} "
               f"{'progress':{BAR_WIDTH}} tasks")
@@ -1025,11 +1087,11 @@ class Engine:
                   f"{self._bar(c, color) if scale else ' ' * BAR_WIDTH} "
                   f"{self._hist(c, color)}")
 
-        def failures(u, rec):
+        def failures(u):
             """Name the tasks whose own state is not COMPLETED. Silent when every
             task shares the unit's state -- the row already said that, and listing
             240 identical identities is noise."""
-            per_task = self._task_states(u, rec)
+            per_task = self._task_states(u, nodestates.get(u.name))
             bad = [(n, st) for n, st in sorted(per_task.items(),
                                                key=lambda kv: kv[0].array_index or 0)
                    if st != "COMPLETED"]
@@ -1043,7 +1105,7 @@ class Engine:
         def counts(us):
             c = defaultdict(int)
             for u in us:
-                for st in self._task_states(u, state.get(u.name)).values():
+                for st in self._task_states(u, nodestates.get(u.name)).values():
                     c[st] += 1
             return c
 
@@ -1054,7 +1116,7 @@ class Engine:
             for u in us:
                 row(u.name, [u])
                 if state.get(u.name):
-                    failures(u, state.get(u.name))
+                    failures(u)
 
     @staticmethod
     def _by_recipe(units):
@@ -1284,12 +1346,31 @@ class Engine:
         # state straight from the log and never consult sacct. A job that isn't
         # COMPLETED (incl. a stale SUBMITTED from an interrupted local run) reruns.
         state = self._read_log(log_path) if local else self.reconcile(sacct, log_path)
+        nodestates = self._node_states(log_path)
 
         def eligible(st):
             return st != "COMPLETED" if local else (not is_live(st) and st != "COMPLETED")
 
         def needs_run(st):
             return eligible(st) and (st is None if no_retry else True)
+
+        def unit_state(u):
+            return (state.get(u.name) or {}).get("state")
+
+        def pending(u):
+            """The nodes this run would actually submit -- spec.md §11's "only nodes
+            whose latest state is not COMPLETED", now acted on rather than merely
+            reported. A unit whose latest record is still live is left alone whole:
+            one live job per unit is what the log's single `job_id` can describe.
+            `--rerun` is the verb for redoing work that did succeed, so a forced unit
+            runs entire."""
+            if u in forced:
+                return list(u.nodes)
+            if not local and is_live(unit_state(u)):
+                return []
+            per_node = nodestates.get(u.name) or {}
+            return [n for n in u.nodes
+                    if needs_run((per_node.get(n.ident) or {}).get("state"))]
 
         scoped = bool(only) and set(only) != {"*"}
         if scoped:
@@ -1308,8 +1389,8 @@ class Engine:
             scope |= set(self._unready_ancestors(scope, state, eligible))
 
         forced = set(self._matching_units(rerun, scope))
-        torun = {u for u in scope
-                 if u in forced or needs_run((state.get(u.name) or {}).get("state"))}
+        pend = {u: pending(u) for u in scope}
+        torun = {u for u in scope if pend[u]}
 
         if not scoped:
             children = self._children()               # downstream of a rerun is stale
@@ -1351,13 +1432,20 @@ class Engine:
         blocked, frontier, children = {}, [], self._children()
         if no_retry:                                  # declined to retry a past attempt
             for u in scope:
-                st = (state.get(u.name) or {}).get("state")
-                if u not in forced and eligible(st) and not needs_run(st):
-                    frontier.append((u, f"blocked by {u.name} {st or 'absent'}"))
+                if u in forced:
+                    continue
+                per_node = nodestates.get(u.name) or {}
+                running = {n.ident for n in pend[u]}
+                held = [(per_node.get(n.ident) or {}).get("state") for n in u.nodes
+                        if n.ident not in running
+                        and eligible((per_node.get(n.ident) or {}).get("state"))]
+                if held:                              # output nobody is going to produce
+                    frontier.append((u, f"blocked by {u.name} {held[0] or 'absent'}"))
         for u in self.unit_order:                     # afterok parent that can no longer succeed
             if u not in torun:
                 continue
-            doomed = [(pu, n) for pu, n in self._doomed_afterok(u, state) if pu not in torun]
+            doomed = [(pu, n) for pu, n in self._doomed_afterok(u, state, nodestates)
+                      if pu not in torun]
             if doomed:
                 pu, nbad = doomed[0]
                 blocked[u] = (f"afterok parent {pu.name} has {nbad} failed "
@@ -1384,10 +1472,21 @@ class Engine:
                 if is_live((state.get(u.name) or {}).get("state"))}
         keep = torun | live
 
+        def sparse(u):
+            """The task indices to submit, or None when that is the whole array --
+            keeping the untouched common case byte-identical to before."""
+            if u.kind != "array":
+                return None
+            idx = sorted(n.array_index for n in pend[u])
+            return idx if len(idx) < len(u.nodes) else None
+
         def record(u, jid, st):
-            return json.dumps({"unit": u.name, "kind": u.kind, "job_id": jid, "state": st,
-                               "event": "submit", "nodes": self._logged_nodes(u),
-                               "time": time.time()}) + "\n"
+            r = {"unit": u.name, "kind": u.kind, "job_id": jid, "state": st,
+                 "event": "submit", "nodes": self._logged_nodes(u), "time": time.time()}
+            idx = sparse(u)
+            if idx is not None:
+                r["indices"] = idx
+            return json.dumps(r) + "\n"
 
         # An in-wave parent has no id yet, while a live or skipped one keeps its logged
         # id, so a dry run's dependency tokens are legitimately a mix of real and
@@ -1403,9 +1502,9 @@ class Engine:
                         print(f"skip   {u.name}\t({why})")
                     continue
                 if dry:
-                    print(" ".join(self._runner_argv(cc, u, wd, dry_uid, keep)))
+                    print(" ".join(self._runner_argv(cc, u, wd, dry_uid, keep, sparse(u))))
                     continue
-                proc = self._invoke_cc(cc, u, wd, keep)
+                proc = self._invoke_cc(cc, u, wd, keep, sparse(u))
                 jid = proc.stdout.strip().split()[-1] if proc.stdout.strip() else None
                 if proc.returncode != 0:
                     if local:                         # record the failure before aborting
